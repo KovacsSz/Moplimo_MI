@@ -1,16 +1,36 @@
 /**
  * SMT Pick and Place Machine Controller
  * Express + Socket.IO backend server
- * Auto-connects on startup and monitors for PCB Loader (Slave ID 5)
+ *
+ * Auto-detects the correct serial port by pinging Slave ID 4
+ * (Discrete Input 0 / IS_UI_LOADED), then monitors for PCB Loader (Slave ID 5).
+ *
+ * Handles all 3 real-world cases without crashing:
+ *   Case 1 — USB-RS485 adapter NOT connected
+ *   Case 2 — USB-RS485 adapter connected, Station 4 NOT connected / no answer
+ *   Case 3 — USB-RS485 adapter connected, Station 4 connected and responding
  */
 
 'use strict';
 
-const express    = require('express');
-const http       = require('http');
+// ─── GLOBAL UNHANDLED-ERROR SAFETY NET ───────────────────────────────────────
+// modbus-serial / serialport can emit 'error' events on the underlying
+// EventEmitter after we have already called close(). This guard prevents
+// Node from crashing on those late-arriving errors.
+process.on('uncaughtException', (err) => {
+  console.warn('[Process] Caught unhandled exception (suppressed):', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.warn('[Process] Caught unhandled rejection (suppressed):', reason);
+});
+
+const express        = require('express');
+const http           = require('http');
 const { Server: SocketIOServer } = require('socket.io');
-const cors       = require('cors');
-const path       = require('path');
+const cors           = require('cors');
+const path           = require('path');
+const { SerialPort } = require('serialport');
+const ModbusRTU      = require('modbus-serial');
 
 const ModbusHandler  = require('./src/modbusHandler');
 const StationManager = require('./src/stationManager');
@@ -22,6 +42,10 @@ const {
   HoldingRegisterAddresses,
   CoilAddresses,
   DiscreteInputAddresses,
+  MODBUS_BAUDRATE,
+  MODBUS_PARITY,
+  MODBUS_DATA_BITS,
+  MODBUS_STOP_BITS,
 } = require('./src/modbusDefinitions');
 
 // ─── APP SETUP ────────────────────────────────────────────────────────────────
@@ -34,10 +58,14 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ─── SERIAL PORT CONFIGURATION ────────────────────────────────────────────────
-const SERIAL_PORT = process.env.MODBUS_PORT || 'COM5';
+// ─── PORT DETECTION CONFIGURATION ────────────────────────────────────────────
+
+const PROBE_SLAVE_ID       = 4;      // Station always present — used for port ID
+const PROBE_TIMEOUT_MS     = 800;    // Per-port probe timeout
+const PORT_RESCAN_DELAY_MS = 10000;  // Retry delay when no port found
 
 // ─── TIMING CONSTANTS ─────────────────────────────────────────────────────────
+
 const LOADER_WATCH_INTERVAL_MS = 2000;
 const LOADER_PING_RETRIES      = 2;
 const RESET_POLL_INTERVAL_MS   = 500;
@@ -53,6 +81,7 @@ let availableStations = [];
 let loaderStationId   = PCB_LOADER_SLAVE_ID;
 let pnpStations       = [];
 let pendingTotalPcbs  = 10;
+let detectedPort      = null;
 
 let loaderWatchActive = false;
 let loaderWatchTimer  = null;
@@ -63,11 +92,13 @@ let systemStatus  = 'idle';
 let statusMessage = 'Starting up…';
 let initLogBuffer = [];
 
+const PARITY_MAP = { N: 'none', E: 'even', O: 'odd' };
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ─── BROADCAST HELPERS ────────────────────────────────────────────────────────
+// ─── LOGGING / BROADCAST ──────────────────────────────────────────────────────
 
 function broadcast(event, data) {
   io.emit(event, data);
@@ -89,21 +120,21 @@ function setStatus(status, message) {
   console.log(`[Status] ${status}: ${message}`);
 }
 
+function broadcastSystemState() {
+  broadcast('systemState', buildSystemState());
+}
+
 function buildSystemState() {
   return {
     systemStatus,
     statusMessage,
-    serialPort:        SERIAL_PORT,
+    serialPort:        detectedPort ?? '—',
     loaderPresent,
     connected:         modbusHandler?.connected ?? false,
     availableStations,
     loaderStationId,
     pnpStations,
   };
-}
-
-function broadcastSystemState() {
-  broadcast('systemState', buildSystemState());
 }
 
 // ─── MANAGER EMIT ─────────────────────────────────────────────────────────────
@@ -133,9 +164,6 @@ function managerEmit(event) {
       break;
 
     case 'productionComplete':
-      // Stations remain in last hardware state.
-      // Reset happens only after operator confirms the summary dialog
-      // via POST /api/operation/acknowledge-complete.
       setStatus('ready', 'Production complete — awaiting operator confirmation');
       break;
 
@@ -157,6 +185,246 @@ function managerEmit(event) {
       broadcast('setupComplete', {});
       break;
   }
+}
+
+// ─── SERIAL PORT AUTO-DETECTION ───────────────────────────────────────────────
+
+/**
+ * getCandidatePorts()
+ *
+ * Windows : all COMx ports returned by SerialPort.list()
+ * Linux   : ttyUSB*, ttyACM*, ttyAMA*, ttyS0-ttyS3
+ */
+async function getCandidatePorts() {
+  let all = [];
+  try {
+    all = await SerialPort.list();
+  } catch (err) {
+    console.error('[Probe] SerialPort.list() failed:', err.message);
+    return [];
+  }
+
+  const candidates = all.filter((p) => {
+    const pt = p.path;
+    if (process.platform === 'win32') return true;
+    if (/\/dev\/ttyUSB\d+/.test(pt))  return true;
+    if (/\/dev\/ttyACM\d+/.test(pt))  return true;
+    if (/\/dev\/ttyAMA\d+/.test(pt))  return true;
+    if (/\/dev\/ttyS[0-3]$/.test(pt)) return true;
+    return false;
+  });
+
+  // USB adapters first (most likely), then ACM, AMA, ttyS
+  candidates.sort((a, b) => {
+    const rank = (pt) => {
+      if (pt.includes('ttyUSB')) return 0;
+      if (pt.includes('ttyACM')) return 1;
+      if (pt.includes('ttyAMA')) return 2;
+      return 3;
+    };
+    return rank(a.path) - rank(b.path);
+  });
+
+  return candidates;
+}
+
+/**
+ * silentClose(client)
+ *
+ * Closes a ModbusRTU client and its underlying port without allowing
+ * any 'error' events to propagate.
+ */
+function silentClose(client) {
+  if (!client) return;
+  try {
+    // Remove all listeners from the underlying port before closing
+    const port = client._port;
+    if (port) {
+      try { port.removeAllListeners(); } catch { /* ignore */ }
+    }
+    // Also silence the client itself
+    try { client.removeAllListeners(); } catch { /* ignore */ }
+    // Now close
+    if (client.isOpen) {
+      client.close(() => {});
+    }
+  } catch { /* ignore every possible error */ }
+}
+
+/**
+ * probePort(portPath)
+ *
+ * Opens portPath with project Modbus settings, reads Discrete Input 0
+ * (IS_UI_LOADED) from Slave ID 4.
+ *
+ * Returns true  → Station 4 responded   (Case 3)
+ * Returns false → port opened but no response (Case 2)
+ *              OR port could not be opened     (Case 1)
+ *
+ * NEVER throws, NEVER leaves an unhandled error event.
+ */
+async function probePort(portPath) {
+  console.log(`[Probe] Testing ${portPath} …`);
+
+  // We build the Modbus client directly here (not via ModbusHandler)
+  // so we have full control over the lifecycle and error listeners.
+  const client = new ModbusRTU();
+
+  // Arm a catch-all error listener BEFORE anything else.
+  // This prevents Node from crashing if the port emits 'error'
+  // after we call close() (Windows serial driver timing issue).
+  const noop = () => {};
+  client.on('error', noop);
+
+  let opened = false;
+
+  try {
+    // ── Try to open the port ──────────────────────────────────────────────
+    await client.connectRTUBuffered(portPath, {
+      baudRate: MODBUS_BAUDRATE,
+      parity:   PARITY_MAP[MODBUS_PARITY] ?? 'none',
+      stopBits: MODBUS_STOP_BITS,
+      dataBits: MODBUS_DATA_BITS,
+    });
+    opened = true;
+
+    // Also attach the noop to the underlying serialport's error event
+    try {
+      if (client._port) client._port.on('error', noop);
+    } catch { /* ignore */ }
+
+    client.setTimeout(PROBE_TIMEOUT_MS);
+
+    // Small settling delay after open
+    await sleep(150);
+
+    // ── Try to read Discrete Input 0 from Slave ID 4 ──────────────────────
+    client.setID(PROBE_SLAVE_ID);
+
+    let responded = false;
+    try {
+      const result = await client.readDiscreteInputs(
+        DiscreteInputAddresses.IS_UI_LOADED, 1
+      );
+      responded = result !== null && result.data !== undefined;
+    } catch {
+      // Timeout or Modbus error — station not present on this port
+      responded = false;
+    }
+
+    console.log(
+      responded
+        ? `[Probe] ${portPath}: ✓ Slave ${PROBE_SLAVE_ID} responded`
+        : `[Probe] ${portPath}: no response from Slave ${PROBE_SLAVE_ID} (station absent?)`
+    );
+
+    return responded;
+
+  } catch (err) {
+    // connect() failed — adapter not present or access denied
+    console.log(`[Probe] ${portPath}: could not open — ${err.message}`);
+    return false;
+
+  } finally {
+    // Always close cleanly, suppressing every possible error
+    await sleep(50);  // let any pending I/O settle first
+    silentClose(client);
+    await sleep(250); // let OS release the port
+  }
+}
+
+/**
+ * autoDetectPort()
+ *
+ * Probes each candidate port in order and returns the first one
+ * where Station 4 responds. Returns null if none respond.
+ */
+async function autoDetectPort() {
+  const candidates = await getCandidatePorts();
+
+  if (candidates.length === 0) {
+    console.log('[Probe] No candidate serial ports found on this system');
+    return null;
+  }
+
+  console.log(
+    `[Probe] Scanning ${candidates.length} candidate port(s): ` +
+    candidates.map((p) => p.path).join(', ')
+  );
+
+  for (const candidate of candidates) {
+    const found = await probePort(candidate.path);
+    if (found) {
+      console.log(`[Probe] ✓ Modbus bus detected on ${candidate.path}`);
+      return candidate.path;
+    }
+  }
+
+  console.log('[Probe] No port responded — adapter absent or Station 4 not connected');
+  return null;
+}
+
+/**
+ * autoConnect()
+ *
+ * 1. Auto-detect the correct port
+ * 2. Open a permanent ModbusHandler on that port
+ * 3. Start the PCB Loader watch loop
+ *
+ * Retries every PORT_RESCAN_DELAY_MS if detection fails.
+ */
+async function autoConnect() {
+  setStatus('connecting', 'Scanning serial ports for Modbus bus…');
+  console.log('[Server] Starting serial port auto-detection…');
+
+  const portPath = await autoDetectPort();
+
+  if (!portPath) {
+    const msg =
+      `No Modbus bus found. ` +
+      `Retrying in ${PORT_RESCAN_DELAY_MS / 1000} s…`;
+    setStatus('error', msg);
+    console.error(`[Server] ${msg}`);
+    setTimeout(autoConnect, PORT_RESCAN_DELAY_MS);
+    return;
+  }
+
+  detectedPort = portPath;
+  setStatus('connecting', `Port ${portPath} identified — connecting…`);
+
+  // Clean up any previous handler
+  if (modbusHandler) {
+    try { modbusHandler.disconnect(); } catch { /* ignore */ }
+    modbusHandler = null;
+  }
+
+  modbusHandler = new ModbusHandler(portPath, {
+    timeoutMs:    1000,
+    retries:      2,
+    retryDelayMs: 200,
+  });
+
+  const connected = await modbusHandler.connect();
+  if (!connected) {
+    const msg =
+      `Failed to open ${portPath}. ` +
+      `Retrying in ${PORT_RESCAN_DELAY_MS / 1000} s…`;
+    setStatus('error', msg);
+    console.error(`[Server] ${msg}`);
+    detectedPort  = null;
+    modbusHandler = null;
+    setTimeout(autoConnect, PORT_RESCAN_DELAY_MS);
+    return;
+  }
+
+  console.log(`[Server] Serial port ${portPath} open`);
+  setStatus(
+    'idle',
+    `Port ${portPath} open — watching for PCB Loader (Slave ID ${PCB_LOADER_SLAVE_ID})…`
+  );
+
+  await sleep(200);
+  startLoaderWatch();
 }
 
 // ─── PCB LOADER WATCH LOOP ────────────────────────────────────────────────────
@@ -234,7 +502,6 @@ async function onLoaderDetected() {
     availableStations = [];
     pnpStations       = [];
     stationManager    = null;
-
     broadcast('connectionState', {
       connected:         false,
       availableStations: [],
@@ -249,7 +516,7 @@ async function onLoaderDetected() {
 // ─── LOADER REMOVED ──────────────────────────────────────────────────────────
 
 async function onLoaderRemoved() {
-  console.log('[Server] PCB Loader removed');
+  console.log('[Server] PCB Loader removed — resetting all stations to idle');
 
   if (stationManager) {
     stationManager._stopPolling();
@@ -260,10 +527,8 @@ async function onLoaderRemoved() {
     for (const sid of pnpStations) {
       try {
         await modbusHandler.setActivePage(sid, PageID.PLACEMENT_PARAMETERS_SETUP);
-        console.log(`[Server] Station ${sid} → setup page`);
-      } catch {
-        // Station may be offline
-      }
+        console.log(`[Server] Station ${sid} returned to setup page`);
+      } catch { /* station may also be offline */ }
     }
   }
 
@@ -339,7 +604,9 @@ async function runInitSequence() {
       const names = [...pending].map((s) =>
         s === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `Pick & Place ${s}`
       );
-      throw new Error(`Reset timeout for: ${names.join(', ')}`);
+      throw new Error(
+        `Reset timeout (${RESET_TOTAL_TIMEOUT_MS / 1000}s) for: ${names.join(', ')}`
+      );
     }
     for (const sid of [...pending]) {
       const done = await modbusHandler.checkSoftResetComplete(sid);
@@ -357,7 +624,7 @@ async function runInitSequence() {
   }
 
   // Phase 3: Wait for UI load
-  log('\nPhase 3 — Waiting for UIs to load…');
+  log('\nPhase 3 — Waiting for UIs to load on all stations…');
   broadcast('initProgress', { pct: 55 });
 
   for (let i = 0; i < allStations.length; i++) {
@@ -369,7 +636,9 @@ async function runInitSequence() {
       sid, UI_WAIT_PER_STATION_MS, UI_POLL_INTERVAL_MS
     );
     if (!uiLoaded) {
-      throw new Error(`${name} UI did not load within ${UI_WAIT_PER_STATION_MS / 1000}s`);
+      throw new Error(
+        `${name} UI did not load within ${UI_WAIT_PER_STATION_MS / 1000}s`
+      );
     }
     log(`  ✓ ${name}: UI loaded`);
     broadcast('initProgress', {
@@ -377,7 +646,7 @@ async function runInitSequence() {
     });
   }
 
-  // Phase 4: Verify IDs, set setup page, write defaults
+  // Phase 4: Verify IDs, set setup page, write default counts
   log('\nPhase 4 — Verifying IDs, setting setup page and default components…');
   broadcast('initProgress', { pct: 78 });
 
@@ -386,12 +655,16 @@ async function runInitSequence() {
     const name = sid === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `Pick & Place ${sid}`;
 
     const stationId = await modbusHandler.getStationId(sid);
-    if (stationId === null) throw new Error(`${name}: could not read station ID register`);
+    if (stationId === null) {
+      throw new Error(`${name}: could not read station ID register`);
+    }
     if (stationId !== sid) {
       throw new Error(`${name} ID mismatch: expected ${sid}, got ${stationId}`);
     }
 
-    const pageOk = await modbusHandler.setActivePage(sid, PageID.PLACEMENT_PARAMETERS_SETUP);
+    const pageOk = await modbusHandler.setActivePage(
+      sid, PageID.PLACEMENT_PARAMETERS_SETUP
+    );
     if (!pageOk) throw new Error(`Failed to set setup page for ${name}`);
 
     const countsOk = await modbusHandler.setTotalPositions(
@@ -401,10 +674,12 @@ async function runInitSequence() {
       DefaultComponentCounts.ics,
       DefaultComponentCounts.capacitors
     );
-    if (!countsOk) throw new Error(`Failed to write default counts to ${name}`);
+    if (!countsOk) {
+      throw new Error(`Failed to write default component counts to ${name}`);
+    }
 
     log(
-      `  ✓ ${name}: verified, setup page set, defaults written ` +
+      `  ✓ ${name}: ID verified, setup page set, defaults written ` +
       `(T:${DefaultComponentCounts.transistors} ` +
       `D:${DefaultComponentCounts.diodes} ` +
       `IC:${DefaultComponentCounts.ics} ` +
@@ -441,35 +716,6 @@ async function runInitSequence() {
   });
 }
 
-// ─── AUTO-CONNECT ─────────────────────────────────────────────────────────────
-
-async function autoConnect() {
-  console.log(`[Server] Auto-connecting to serial port: ${SERIAL_PORT}`);
-  setStatus('connecting', `Opening serial port ${SERIAL_PORT}…`);
-
-  modbusHandler = new ModbusHandler(SERIAL_PORT, {
-    timeoutMs:    1000,
-    retries:      2,
-    retryDelayMs: 200,
-  });
-
-  const connected = await modbusHandler.connect();
-  if (!connected) {
-    setStatus('error', `Failed to open ${SERIAL_PORT} — retrying in 10 s…`);
-    console.error(`[Server] Cannot open ${SERIAL_PORT} — retrying in 10 s`);
-    setTimeout(autoConnect, 10000);
-    return;
-  }
-
-  console.log(`[Server] Serial port ${SERIAL_PORT} open`);
-  setStatus(
-    'idle',
-    `Port ${SERIAL_PORT} open — watching for PCB Loader (Slave ID ${PCB_LOADER_SLAVE_ID})…`
-  );
-  await sleep(200);
-  startLoaderWatch();
-}
-
 // ─── SOCKET.IO ────────────────────────────────────────────────────────────────
 
 io.on('connection', (socket) => {
@@ -496,12 +742,10 @@ io.on('connection', (socket) => {
 
 // ─── REST API ─────────────────────────────────────────────────────────────────
 
-// System status
 app.get('/api/system/status', (_req, res) => {
   res.json(buildSystemState());
 });
 
-// Setup: read component distribution
 app.get('/api/setup/components', async (_req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   try {
@@ -523,7 +767,6 @@ app.get('/api/setup/components', async (_req, res) => {
   }
 });
 
-// Setup: write total positions to a station
 app.post('/api/setup/total-positions', async (req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   const { slaveId, transistors, diodes, ics, capacitors } = req.body;
@@ -537,7 +780,6 @@ app.post('/api/setup/total-positions', async (req, res) => {
   }
 });
 
-// Setup: activate / deactivate physical start button
 app.post('/api/setup/start-button', async (req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   const { active } = req.body;
@@ -556,7 +798,6 @@ app.post('/api/setup/start-button', async (req, res) => {
   }
 });
 
-// Operation: stop production (manual)
 app.post('/api/operation/stop', async (_req, res) => {
   if (!stationManager) return res.status(400).json({ error: 'Not connected' });
   try {
@@ -567,46 +808,31 @@ app.post('/api/operation/stop', async (_req, res) => {
   }
 });
 
-// Operation: set total PCBs
 app.post('/api/operation/set-total', (req, res) => {
   const { totalPcbs } = req.body;
   if (totalPcbs && Number(totalPcbs) > 0) pendingTotalPcbs = Number(totalPcbs);
   res.json({ success: true, totalPcbs: pendingTotalPcbs });
 });
 
-// Operation: get snapshot
 app.get('/api/operation/snapshot', (_req, res) => {
   if (!stationManager) return res.status(400).json({ error: 'Not connected' });
   res.json(stationManager.getSnapshot());
 });
 
-// Operation: operator confirmed the production-complete dialog
-// Triggers _returnToSetup() on all stations:
-//   coil 17 = false, holding reg 0 = 1, holding regs 2-5 = 5,4,3,2
 app.post('/api/operation/acknowledge-complete', async (_req, res) => {
-  console.log('[Server] /api/operation/acknowledge-complete received');
-
   if (!stationManager) {
-    console.warn('[Server] acknowledge-complete: stationManager is null');
     return res.status(400).json({ error: 'No station manager active' });
   }
-
-  if (!modbusHandler || !modbusHandler.connected) {
-    console.warn('[Server] acknowledge-complete: modbusHandler not connected');
-    return res.status(400).json({ error: 'Modbus not connected' });
-  }
-
   try {
+    console.log('[Server] acknowledge-complete received — running _returnToSetup');
     await stationManager._returnToSetup();
-    console.log('[Server] _returnToSetup completed successfully');
     res.json({ success: true });
   } catch (err) {
-    console.error('[Server] _returnToSetup threw:', err.message);
+    console.error('[Server] _returnToSetup error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Configuration: read from first P&P station
 app.get('/api/configuration', async (_req, res) => {
   if (!modbusHandler || pnpStations.length === 0) {
     return res.status(400).json({ error: 'No P&P stations connected' });
@@ -627,23 +853,12 @@ app.get('/api/configuration', async (_req, res) => {
     );
     res.json({
       timing: timing
-        ? {
-            transistor: timing[0],
-            diode:      timing[1],
-            ic:         timing[2],
-            capacitor:  timing[3],
-            transport:  timing[4],
-          }
+        ? { transistor: timing[0], diode: timing[1], ic: timing[2],
+            capacitor: timing[3], transport: timing[4] }
         : null,
       led: led
-        ? {
-            red:             led[0],
-            yellow:          led[1],
-            green:           led[2],
-            rgb:             led[3],
-            thresholdYellow: led[4],
-            thresholdRed:    led[5],
-          }
+        ? { red: led[0], yellow: led[1], green: led[2], rgb: led[3],
+            thresholdYellow: led[4], thresholdRed: led[5] }
         : null,
       rfid: rfid
         ? Array.from({ length: 4 }, (_, i) => ({
@@ -659,7 +874,6 @@ app.get('/api/configuration', async (_req, res) => {
   }
 });
 
-// Configuration: write to all stations
 app.post('/api/configuration', async (req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   const { timing, led, rfid, volume } = req.body;
@@ -667,23 +881,14 @@ app.post('/api/configuration', async (req, res) => {
     for (const sid of availableStations) {
       if (timing) {
         await modbusHandler.setTimingConfig(
-          sid,
-          timing.transistor,
-          timing.diode,
-          timing.ic,
-          timing.capacitor,
-          timing.transport
+          sid, timing.transistor, timing.diode,
+          timing.ic, timing.capacitor, timing.transport
         );
       }
       if (led) {
         await modbusHandler.setLedConfig(
-          sid,
-          led.red,
-          led.yellow,
-          led.green,
-          led.rgb,
-          led.thresholdYellow,
-          led.thresholdRed
+          sid, led.red, led.yellow, led.green,
+          led.rgb, led.thresholdYellow, led.thresholdRed
         );
       }
       if (rfid) {
@@ -691,9 +896,7 @@ app.post('/api/configuration', async (req, res) => {
         for (const box of rfid) rfidValues.push(box.uidHigh, box.uidLow);
         for (const box of rfid) rfidValues.push(box.count);
         await modbusHandler.writeHoldingRegisters(
-          sid,
-          HoldingRegisterAddresses.RFID_BOX_UID_START,
-          rfidValues
+          sid, HoldingRegisterAddresses.RFID_BOX_UID_START, rfidValues
         );
       }
       if (volume != null) await modbusHandler.setSpeakerVolume(sid, volume);
@@ -704,7 +907,6 @@ app.post('/api/configuration', async (req, res) => {
   }
 });
 
-// Configuration: soft reset all stations
 app.post('/api/configuration/soft-reset', async (_req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   try {
@@ -713,37 +915,29 @@ app.post('/api/configuration/soft-reset', async (_req, res) => {
         throw new Error(`Failed to reset Station ${sid}`);
       }
     }
-
     await sleep(2000);
-
     const timeout = 10000;
     const start   = Date.now();
     let allReset  = false;
-
     while (!allReset && Date.now() - start < timeout) {
       allReset = true;
       for (const sid of availableStations) {
         if (!(await modbusHandler.checkSoftResetComplete(sid))) {
-          allReset = false;
-          break;
+          allReset = false; break;
         }
       }
       if (!allReset) await sleep(200);
     }
-
     if (!allReset) throw new Error('Reset timeout — check station status manually');
-
     for (const sid of availableStations) {
       await modbusHandler.setActivePage(sid, PageID.PLACEMENT_PARAMETERS_SETUP);
     }
-
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Monitoring: all station status
 app.get('/api/monitoring', async (_req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   try {
@@ -770,6 +964,5 @@ app.get('/api/monitoring', async (_req, res) => {
 const PORT = process.env.PORT ?? 3000;
 server.listen(PORT, async () => {
   console.log(`[Server] SMT Pick & Place Controller at http://localhost:${PORT}`);
-  console.log(`[Server] Using serial port: ${SERIAL_PORT}`);
   await autoConnect();
 });
