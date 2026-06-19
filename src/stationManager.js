@@ -113,18 +113,12 @@ class StationManager {
 
   // ── Public API ──────────────────────────────────────────────────────────────
 
-  /**
-   * Called by SetupTab when all components are distributed (available = 0).
-   * Activates physical start button monitoring.
-   * Idempotent — safe to call multiple times.
-   */
   async onSetupComplete() {
     if (this._setupActive) return;
     this._setupActive = true;
 
     this._initTracking();
 
-    // Clear is_next_station_busy on all except the last station
     for (let i = 0; i < this.stationSequence.length - 1; i++) {
       const sid = this.stationSequence[i];
       await this.mh.setNextStationBusy(sid, false);
@@ -139,9 +133,6 @@ class StationManager {
     this.emit({ type: 'setupComplete' });
   }
 
-  /**
-   * Called when distribution changes back to incomplete.
-   */
   onSetupIncomplete() {
     if (!this._setupActive) return;
     this._setupActive        = false;
@@ -150,9 +141,6 @@ class StationManager {
     console.log('[Manager] Setup monitoring stopped (distribution changed)');
   }
 
-  /**
-   * Start production.
-   */
   async startProduction(totalPcbs) {
     if (this.productionActive) {
       console.warn('[Manager] startProduction called while already active — ignored');
@@ -169,10 +157,8 @@ class StationManager {
     this._stopPolling();
     this.buttonMonitorActive = false;
 
-    // Deactivate physical button at production start
     await this.mh.setStartButtonActive(this.loaderStationId, false);
 
-    // Reset tracking
     this.cycleStartTimes = {};
     this.pendingTrigger  = {};
     for (const sid of this.stationSequence) {
@@ -188,9 +174,6 @@ class StationManager {
     await this._triggerNextPcb();
   }
 
-  /**
-   * Stop production manually.
-   */
   async stopProduction() {
     this.productionActive = false;
     this._setupActive     = false;
@@ -200,9 +183,6 @@ class StationManager {
     await this._returnToSetup();
   }
 
-  /**
-   * Snapshot for UI.
-   */
   getSnapshot() {
     const elapsed = this.productionStartTime
       ? (Date.now() - this.productionStartTime) / 1000
@@ -247,7 +227,7 @@ class StationManager {
   async _poll() {
     if (!this.mh.connected) return;
 
-    // ── Button monitoring ────────────────────────────────────────────────────
+    // Button monitoring
     if (this.buttonMonitorActive && !this.productionActive) {
       try {
         const pressed = await this.mh.checkStartButtonPressed(this.loaderStationId);
@@ -266,7 +246,6 @@ class StationManager {
       return;
     }
 
-    // ── Station polling ──────────────────────────────────────────────────────
     if (!this.productionActive) return;
 
     for (let idx = 0; idx < this.stationSequence.length; idx++) {
@@ -281,7 +260,9 @@ class StationManager {
       if (!statusData) {
         this.readFailures[slaveId] = (this.readFailures[slaveId] ?? 0) + 1;
         if (this.readFailures[slaveId] === 3) {
-          console.warn(`[Manager] ${this.getStationName(slaveId)}: 3 consecutive read failures`);
+          console.warn(
+            `[Manager] ${this.getStationName(slaveId)}: 3 consecutive read failures`
+          );
         }
         continue;
       }
@@ -319,7 +300,6 @@ class StationManager {
           statusName: newName,
         });
 
-        // Trigger next station on unload
         if (statusCode === PlacementStatus.UNLOADING_POPULATED_PCB) {
           const pcbId = this.pcbAtStation[slaveId] ?? 0;
           if (pcbId > 0) {
@@ -329,7 +309,6 @@ class StationManager {
           }
         }
 
-        // Manage is_next_station_busy
         if (idx > 0) {
           const prevId   = this.stationSequence[idx - 1];
           const prevName = this.getStationName(prevId);
@@ -357,7 +336,6 @@ class StationManager {
           }
         }
 
-        // Cycle time / completion tracking
         if (statusCode === PlacementStatus.IDLE_WAITING_FOR_NEW_PCB) {
           const pcbId = this.pcbAtStation[slaveId] ?? 0;
 
@@ -406,7 +384,6 @@ class StationManager {
         }
       }
 
-      // Loader idle → load next PCB
       if (
         slaveId === this.loaderStationId &&
         statusCode === PlacementStatus.IDLE_WAITING_FOR_NEW_PCB
@@ -416,7 +393,6 @@ class StationManager {
 
       this.emit({ type: 'snapshot', data: this.getSnapshot() });
 
-      // Check complete
       if (this.productionActive && this.pcbsCompleted >= this.totalPcbs) {
         await this._productionComplete();
         return;
@@ -486,7 +462,7 @@ class StationManager {
         await mh.setInputPopulatedCoils(slaveId, new Array(14).fill(false));
         console.warn(
           `[Manager] Could not read output coils from ` +
-          `${this.getStationName(sourceSlaveId)}; cleared input coils on ${stationName}`
+          `${this.getStationName(sourceSlaveId)}; cleared input on ${stationName}`
         );
       }
     } else {
@@ -504,6 +480,7 @@ class StationManager {
   // ── Production lifecycle ────────────────────────────────────────────────────
 
   async _productionComplete() {
+    // Stop poll loop immediately — no more station reads
     this.productionActive = false;
     this._stopPolling();
 
@@ -512,7 +489,7 @@ class StationManager {
       `[Manager] Production complete: ${this.totalPcbs} PCBs in ${totalTime.toFixed(1)}s`
     );
 
-    // Emit completion FIRST so GUI can show the summary
+    // Emit to GUI — stations stay in last hardware state until operator confirms
     this.emit({
       type:             'productionComplete',
       totalPcbs:        this.totalPcbs,
@@ -520,85 +497,86 @@ class StationManager {
       throughputPerMin: (this.totalPcbs / totalTime) * 60,
     });
 
-    // Then run the full return-to-setup sequence
-    await this._returnToSetup();
+    // _returnToSetup() is called only after operator confirms the dialog
+    // via POST /api/operation/acknowledge-complete
   }
 
-  /**
-   * _returnToSetup()
-   *
-   * Executed after every production end (complete or manual stop).
-   * Steps — in exact order:
-   *
-   *  1. Deactivate physical start button  (coil 17 = false)
-   *  2. Set every station to Setup page   (holding reg 0 = 1)
-   *  3. Write DefaultComponentCounts to   (holding regs 2-3-4-5 = 5,4,3,2)
-   *     every station so the hardware
-   *     matches the GUI defaults
-   *  4. Reset internal _setupActive flag
-   *     so onSetupComplete() can fire again
-   *  5. Emit 'returnedToSetup' so the GUI
-   *     resets the distribution display
-   *     and re-enables the Setup tab
-   */
+  // ── _returnToSetup ──────────────────────────────────────────────────────────
+  //
+  // Resets ALL stations to setup mode. Called either:
+  //   (a) by POST /api/operation/acknowledge-complete  (after production complete)
+  //   (b) directly by stopProduction()                 (manual stop)
+  //
+  // Writes over Modbus in this exact order per station:
+  //   1. setStartButtonActive(loader, false)  → coil 17 = false
+  //   2. setActivePage(sid, SETUP)            → holding reg 0 = 1
+  //   3. setTotalPositions(sid, 5,4,3,2)      → holding regs 2,3,4,5
+  //
+  // Then resets all internal manager state and emits 'returnedToSetup'.
+
   async _returnToSetup() {
+    console.log('[Manager] _returnToSetup: BEGIN');
+
     const allStations = [this.loaderStationId, ...this.pnpStations];
 
-    console.log('[Manager] _returnToSetup: starting');
-
-    // ── Step 1: deactivate physical start button ─────────────────────────────
-    const btnOk = await this.mh.setStartButtonActive(this.loaderStationId, false);
-    console.log(
-      btnOk
-        ? '[Manager] ✓ Physical start button deactivated (coil 17 = false)'
-        : '[Manager] ✗ WARNING: failed to deactivate start button'
-    );
-
-    // ── Steps 2 & 3: setup page + default counts on every station ────────────
-    for (const sid of allStations) {
-      const name = this.getStationName(sid);
-
-      // Set setup page (ACTIVE_PAGE_ID = 1)
-      const pageOk = await this.mh.setActivePage(sid, PageID.PLACEMENT_PARAMETERS_SETUP);
+    // ── Step 1: deactivate physical start button ───────────────────────────
+    console.log('[Manager] Step 1: deactivating start button');
+    try {
+      const ok = await this.mh.setStartButtonActive(this.loaderStationId, false);
       console.log(
-        pageOk
-          ? `[Manager] ✓ ${name}: ACTIVE_PAGE_ID set to 1 (Setup)`
-          : `[Manager] ✗ WARNING: failed to set setup page on ${name}`
+        `[Manager] setStartButtonActive → ${ok ? 'OK' : 'FAILED'}`
       );
-
-      // Write DefaultComponentCounts to holding registers 2-3-4-5
-      const countsOk = await this.mh.setTotalPositions(
-        sid,
-        DefaultComponentCounts.transistors,   // reg 2 = 5
-        DefaultComponentCounts.diodes,         // reg 3 = 4
-        DefaultComponentCounts.ics,            // reg 4 = 3
-        DefaultComponentCounts.capacitors      // reg 5 = 2
-      );
-      console.log(
-        countsOk
-          ? `[Manager] ✓ ${name}: default counts written ` +
-            `(T=${DefaultComponentCounts.transistors} ` +
-            `D=${DefaultComponentCounts.diodes} ` +
-            `IC=${DefaultComponentCounts.ics} ` +
-            `C=${DefaultComponentCounts.capacitors})`
-          : `[Manager] ✗ WARNING: failed to write default counts to ${name}`
-      );
+    } catch (err) {
+      console.error('[Manager] setStartButtonActive threw:', err.message);
     }
 
-    // ── Step 4: reset internal flags so the next run starts cleanly ──────────
+    // ── Steps 2 & 3: setup page + default counts on every station ──────────
+    for (const sid of allStations) {
+      const name = this.getStationName(sid);
+      console.log(`[Manager] Resetting ${name} (ID ${sid})`);
+
+      // holding reg 0 = 1  (Setup page)
+      try {
+        const ok = await this.mh.setActivePage(sid, PageID.PLACEMENT_PARAMETERS_SETUP);
+        console.log(`[Manager]   setActivePage(${sid}, SETUP) → ${ok ? 'OK' : 'FAILED'}`);
+      } catch (err) {
+        console.error(`[Manager]   setActivePage(${sid}) threw:`, err.message);
+      }
+
+      // holding regs 2-3-4-5 = 5,4,3,2
+      try {
+        const ok = await this.mh.setTotalPositions(
+          sid,
+          DefaultComponentCounts.transistors,
+          DefaultComponentCounts.diodes,
+          DefaultComponentCounts.ics,
+          DefaultComponentCounts.capacitors
+        );
+        console.log(
+          `[Manager]   setTotalPositions(${sid}, ` +
+          `${DefaultComponentCounts.transistors},` +
+          `${DefaultComponentCounts.diodes},` +
+          `${DefaultComponentCounts.ics},` +
+          `${DefaultComponentCounts.capacitors}) → ${ok ? 'OK' : 'FAILED'}`
+        );
+      } catch (err) {
+        console.error(`[Manager]   setTotalPositions(${sid}) threw:`, err.message);
+      }
+    }
+
+    // ── Step 4: reset all internal state ───────────────────────────────────
+    this.productionActive    = false;
     this._setupActive        = false;
     this.buttonMonitorActive = false;
     this.buttonWasPressed    = false;
-    this.productionActive    = false;
-
-    // Reset all tracking so getSnapshot() returns a clean state
+    this._stopPolling();
     this._initTracking();
     this.cycleStartTimes = {};
     this.pendingTrigger  = {};
 
-    console.log('[Manager] _returnToSetup: complete — emitting returnedToSetup');
+    console.log('[Manager] _returnToSetup: COMPLETE — emitting returnedToSetup');
 
-    // ── Step 5: notify GUI ────────────────────────────────────────────────────
+    // ── Step 5: notify GUI ─────────────────────────────────────────────────
     this.emit({ type: 'returnedToSetup' });
   }
 }
