@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SMT Pick &amp; Place Controller</title>
+    <link rel="stylesheet" href="css/styles.css" />
+  </head>
+  <body>
+
+    <!-- ── HEADER ──────────────────────────────────────────────────────────── -->
+    <header>
+      <div class="header-left">
+        <h1>SMT Pick &amp; Place Controller</h1>
+        <span id="connectionBadge" class="badge disconnected">Disconnected</span>
+      </div>
+      <div class="header-right">
+        <span id="loaderBadge" class="badge loader-absent">PCB Loader: Absent</span>
+        <span id="systemStatusBadge" class="badge status-idle">Idle</span>
+      </div>
+    </header>
+
+    <!-- ── STATUS BAR ─────────────────────────────────────────────────────── -->
+    <div id="statusBar" class="status-bar">
+      <span id="statusBarText">Waiting for port selection…</span>
+    </div>
+
+    <!-- ── TAB NAV ────────────────────────────────────────────────────────── -->
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="overview">Overview</button>
+      <button class="tab-btn" data-tab="setup">Setup</button>
+      <button class="tab-btn" data-tab="operation" disabled>Operation</button>
+      <button class="tab-btn" data-tab="configuration" disabled>Configuration</button>
+      <button class="tab-btn" data-tab="monitoring" disabled>Monitoring</button>
+    </nav>
+
+    <main>
+
+      <!-- ══ OVERVIEW TAB ═══════════════════════════════════════════════════ -->
+      <section id="tab-overview" class="tab-panel active">
+
+        <!-- Port selector row -->
+        <div class="card">
+          <h2>Serial Port</h2>
+          <div class="row gap">
+            <label>Port:</label>
+            <select id="portSelect"></select>
+            <button id="refreshPortsBtn">↻ Refresh</button>
+            <button id="connectPortBtn" class="btn-primary" disabled>Connect</button>
+            <button id="disconnectBtn"  class="btn-danger"  disabled>Disconnect</button>
+          </div>
+          <p class="info">Baudrate 115200 · Parity None · 8N1 — System auto-initializes when PCB Loader (ID 5) is detected</p>
+        </div>
+
+        <!-- System overview cards -->
+        <div class="overview-grid">
+
+          <!-- PCB Loader card -->
+          <div class="card status-card" id="loaderCard">
+            <div class="status-card-header">
+              <span class="station-label">PCB Loader</span>
+              <span class="station-id">Slave ID 5</span>
+            </div>
+            <div class="status-indicator" id="loaderIndicator">
+              <div class="indicator-dot absent" id="loaderDot"></div>
+              <span id="loaderStatusText">Not detected</span>
+            </div>
+          </div>
+
+          <!-- P&P station cards (generated) -->
+          <div id="pnpCards" class="pnp-cards-container">
+            <div class="card status-card placeholder-card">
+              <p style="color:#999;text-align:center;margin-top:1rem">
+                P&amp;P stations appear here after initialization
+              </p>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Initialization log -->
+        <div class="card">
+          <h2>Initialization Log</h2>
+          <div id="progressBarWrap" style="display:none">
+            <progress id="initProgress" max="100" value="0"></progress>
+          </div>
+          <div id="initLog" class="log-box"></div>
+        </div>
+
+      </section>
+
+      <!-- ══ SETUP TAB ══════════════════════════════════════════════════════ -->
+      <section id="tab-setup" class="tab-panel">
+
+        <div class="card info-box">
+          <h2>Component Defaults (per PCB)</h2>
+          <table class="info-table">
+            <tr>
+              <th>Transistors</th><td>5</td>
+              <th>Diodes</th><td>4</td>
+              <th>ICs</th><td>3</td>
+              <th>Capacitors</th><td>2</td>
+            </tr>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>Available Components for Distribution</h2>
+          <div class="available-grid">
+            <div class="avail-item">
+              <span>Transistors</span>
+              <span id="avail-transistors" class="avail-count">5</span>
+            </div>
+            <div class="avail-item">
+              <span>Diodes</span>
+              <span id="avail-diodes" class="avail-count">4</span>
+            </div>
+            <div class="avail-item">
+              <span>ICs</span>
+              <span id="avail-ics" class="avail-count">3</span>
+            </div>
+            <div class="avail-item">
+              <span>Capacitors</span>
+              <span id="avail-capacitors" class="avail-count">2</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Component Distribution by Station</h2>
+          <table id="distributionTable" class="data-table">
+            <thead>
+              <tr>
+                <th>Station</th>
+                <th>Transistors</th>
+                <th>Diodes</th>
+                <th>ICs</th>
+                <th>Capacitors</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="card info-box">
+          <h2>How it works</h2>
+          <ol id="setupInstructions">
+            <li>Set <code>num_*_to_place</code> on each P&amp;P station display</li>
+            <li>Application tracks changes and updates available components above</li>
+            <li>When all components reach zero:
+              <ul>
+                <li>Physical start button on PCB Loader activates automatically</li>
+                <li>Press the physical button to start production</li>
+              </ul>
+            </li>
+          </ol>
+        </div>
+
+      </section>
+
+      <!-- ══ OPERATION TAB ══════════════════════════════════════════════════ -->
+      <section id="tab-operation" class="tab-panel">
+
+        <div class="card">
+          <h2>Production Control</h2>
+          <div class="row gap">
+            <label>Total PCBs to produce:</label>
+            <input id="totalPcbsInput" type="number" min="1" max="10000" value="10" />
+            <button id="setPcbsBtn" class="btn-primary">Set</button>
+          </div>
+          <p class="info" style="color:#0066cc">
+            Production starts automatically when physical button on PCB Loader is pressed
+          </p>
+          <button id="stopProductionBtn" class="btn-danger full" disabled>■ Stop Production</button>
+        </div>
+
+        <div class="card">
+          <h2>Production Progress</h2>
+          <p id="progressLabel" style="font-size:1.1rem">Ready to start</p>
+          <progress id="productionProgress" max="100" value="0"></progress>
+        </div>
+
+        <div class="card">
+          <h2>Station Status</h2>
+          <table id="stationStatusTable" class="data-table">
+            <thead>
+              <tr>
+                <th>Station</th>
+                <th>Status</th>
+                <th>PCB ID</th>
+                <th>Cycle Time (s)</th>
+                <th>Avg Cycle Time (s)</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>Statistics</h2>
+          <div class="stats-grid">
+            <div><span>PCBs Completed:</span> <strong id="stat-completed">0</strong></div>
+            <div><span>PCBs Remaining:</span>  <strong id="stat-remaining">0</strong></div>
+            <div><span>Elapsed Time:</span>     <strong id="stat-totalTime">00:00:00</strong></div>
+            <div><span>Throughput:</span>       <strong id="stat-throughput">0 PCB/min</strong></div>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- ══ CONFIGURATION TAB ══════════════════════════════════════════════ -->
+      <section id="tab-configuration" class="tab-panel">
+
+        <div class="card">
+          <h2>Placement Timing (ms)</h2>
+          <table class="form-table">
+            <tr><td>Transistor:</td><td><input id="timing-transistor" type="number" min="0" max="60000" value="500" /> ms</td></tr>
+            <tr><td>Diode:</td>     <td><input id="timing-diode"      type="number" min="0" max="60000" value="400" /> ms</td></tr>
+            <tr><td>IC:</td>        <td><input id="timing-ic"         type="number" min="0" max="60000" value="800" /> ms</td></tr>
+            <tr><td>Capacitor:</td> <td><input id="timing-capacitor"  type="number" min="0" max="60000" value="600" /> ms</td></tr>
+            <tr><td>Transport:</td> <td><input id="timing-transport"  type="number" min="0" max="60000" value="1000" /> ms</td></tr>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>LED Brightness (0–4095)</h2>
+          <table class="form-table">
+            <tr><td>Red:</td>    <td><input type="range" id="led-red"    min="0" max="4095" value="2048" oninput="updateLedLabel('red',this.value)"    /></td><td><span id="led-red-val">2048</span></td></tr>
+            <tr><td>Yellow:</td> <td><input type="range" id="led-yellow" min="0" max="4095" value="2048" oninput="updateLedLabel('yellow',this.value)" /></td><td><span id="led-yellow-val">2048</span></td></tr>
+            <tr><td>Green:</td>  <td><input type="range" id="led-green"  min="0" max="4095" value="2048" oninput="updateLedLabel('green',this.value)"  /></td><td><span id="led-green-val">2048</span></td></tr>
+            <tr><td>RGB:</td>    <td><input type="range" id="led-rgb"    min="0" max="4095" value="2048" oninput="updateLedLabel('rgb',this.value)"    /></td><td><span id="led-rgb-val">2048</span></td></tr>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>LED Thresholds</h2>
+          <table class="form-table">
+            <tr><td>Yellow threshold:</td><td><input id="thresh-yellow" type="number" min="0" max="4095" value="1000" /></td></tr>
+            <tr><td>Red threshold:</td>   <td><input id="thresh-red"    type="number" min="0" max="4095" value="500"  /></td></tr>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>RFID Box Configuration</h2>
+          <table class="data-table">
+            <thead><tr><th>Box</th><th>UID High</th><th>UID Low</th><th>Count</th></tr></thead>
+            <tbody id="rfidTableBody"></tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>Audio</h2>
+          <table class="form-table">
+            <tr><td>Volume:</td>
+              <td><input type="range" id="audio-volume" min="0" max="100" value="50"
+                  oninput="document.getElementById('audio-vol-val').textContent=this.value" /></td>
+              <td><span id="audio-vol-val">50</span></td></tr>
+          </table>
+        </div>
+
+        <div class="row gap" style="margin-top:.5rem">
+          <button id="readConfigBtn"  class="btn-primary">Read from Stations</button>
+          <button id="writeConfigBtn" class="btn-primary">Write to All Stations</button>
+        </div>
+
+        <div class="card" style="margin-top:1rem">
+          <h2>Station Reset</h2>
+          <p>Soft reset restarts all stations. Use if a station is in an error state.</p>
+          <button id="softResetBtn" class="btn-warning full">Soft Reset All Stations</button>
+        </div>
+
+      </section>
+
+      <!-- ══ MONITORING TAB ═════════════════════════════════════════════════ -->
+      <section id="tab-monitoring" class="tab-panel">
+
+        <div class="card">
+          <h2>Component Status (To Place / Available)</h2>
+          <table id="componentStatusTable" class="data-table">
+            <thead><tr><th>Station</th><th>Transistors</th><th>Diodes</th><th>ICs</th><th>Capacitors</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>Input Component Status (Incoming PCB)</h2>
+          <table id="inputStatusTable" class="data-table">
+            <thead><tr><th>Station</th><th>Transistors (5)</th><th>Diodes (4)</th><th>ICs (3)</th><th>Capacitors (2)</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>Output Component Status (Outgoing PCB)</h2>
+          <table id="outputStatusTable" class="data-table">
+            <thead><tr><th>Station</th><th>Transistors (5)</th><th>Diodes (4)</th><th>ICs (3)</th><th>Capacitors (2)</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>Event Log</h2>
+          <div id="eventLog" class="log-box"></div>
+        </div>
+
+      </section>
+
+    </main>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="js/app.js"></script>
+    <script src="js/setupTab.js"></script>
+    <script src="js/operationTab.js"></script>
+    <script src="js/configurationTab.js"></script>
+    <script src="js/monitoringTab.js"></script>
+  </body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "smt-pick-place-controller",
+  "version": "1.0.0",
+  "description": "SMT Pick and Place Machine Controller",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.22.2",
+    "modbus-serial": "^8.0.16",
+    "serialport": "^12.0.0",
+    "socket.io": "^4.6.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
