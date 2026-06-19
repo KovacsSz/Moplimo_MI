@@ -1,6 +1,7 @@
 /**
- * Main application controller
- * Visualization-only — no manual connect/init button
+ * Main application controller — visualization only
+ * No connect/disconnect controls in the GUI.
+ * Server auto-connects; PCB Loader watch handles everything.
  */
 
 'use strict';
@@ -13,59 +14,69 @@ const AppState = {
   pnpStations:       [],
   systemStatus:      'idle',
   loaderPresent:     false,
+  serialPort:        '—',
 };
 
-// ── PlacementStatus (client mirror) ──────────────────────────────────────────
+// ── PlacementStatus mirror ────────────────────────────────────────────────────
 const PlacementStatus = {
-  IDLE_WAITING_FOR_NEW_PCB:      0,
-  LOADING_NEW_PCB:               1,
-  LOADING_NEW_PCB_FINISHED:      2,
-  COMPONENT_PLACEMENT_STARTED:   3,
-  COMPONENT_PLACEMENT_FINISHED:  4,
-  WAITING_TO_START_UNLOADING_PCB:5,
-  UNLOADING_POPULATED_PCB:       6,
-  UNLOADING_FINISHED:            7,
-  ERROR:                         99,
+  IDLE_WAITING_FOR_NEW_PCB:       0,
+  LOADING_NEW_PCB:                1,
+  LOADING_NEW_PCB_FINISHED:       2,
+  COMPONENT_PLACEMENT_STARTED:    3,
+  COMPONENT_PLACEMENT_FINISHED:   4,
+  WAITING_TO_START_UNLOADING_PCB: 5,
+  UNLOADING_POPULATED_PCB:        6,
+  UNLOADING_FINISHED:             7,
+  ERROR:                          99,
   getName(code) {
-    return Object.entries(this).find(([k, v]) => typeof v === 'number' && v === code)?.[0]
-      ?? String(code);
+    return (
+      Object.entries(this).find(
+        ([k, v]) => typeof v === 'number' && v === code
+      )?.[0] ?? `Unknown(${code})`
+    );
   },
 };
 
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
 const socket = io();
 
-socket.on('connect',    () => logMonitoring('Socket connected to server'));
-socket.on('disconnect', () => logMonitoring('Socket disconnected from server'));
+socket.on('connect', () => {
+  console.log('[Socket] Connected');
+  appendMonitorLog('Connected to server');
+});
+socket.on('disconnect', () => {
+  console.log('[Socket] Disconnected');
+  appendMonitorLog('Disconnected from server');
+});
 
-// Full system state update
+// Full system state
 socket.on('systemState', (data) => {
   AppState.connected         = data.connected;
   AppState.availableStations = data.availableStations ?? [];
-  AppState.loaderStationId   = data.loaderStationId ?? 5;
-  AppState.pnpStations       = data.pnpStations ?? [];
-  AppState.systemStatus      = data.systemStatus ?? 'idle';
-  AppState.loaderPresent     = data.loaderPresent ?? false;
+  AppState.loaderStationId   = data.loaderStationId   ?? 5;
+  AppState.pnpStations       = data.pnpStations        ?? [];
+  AppState.systemStatus      = data.systemStatus       ?? 'idle';
+  AppState.loaderPresent     = data.loaderPresent      ?? false;
+  AppState.serialPort        = data.serialPort         ?? '—';
 
-  updateConnectionBadge(data.connected);
-  updateLoaderBadge(data.loaderPresent);
-  updateSystemStatusBadge(data.systemStatus);
-  updateStatusBar(data.statusMessage ?? '');
-  updateTabAccess(data.connected);
-
-  if (data.connected && typeof SetupTab !== 'undefined') {
-    SetupTab.onConnected();
-  }
+  applySystemState(data);
 });
 
-// Legacy connectionState (also sent by server)
+// Legacy connectionState
 socket.on('connectionState', (data) => {
   AppState.connected         = data.connected;
   AppState.availableStations = data.availableStations ?? [];
-  AppState.pnpStations       = data.pnpStations ?? [];
+  AppState.pnpStations       = data.pnpStations        ?? [];
+
   updateConnectionBadge(data.connected);
   updateTabAccess(data.connected);
-  if (data.connected && typeof SetupTab !== 'undefined') SetupTab.onConnected();
+  updateSysInfoTable();
+
+  if (data.connected) {
+    buildPnpCards(AppState.pnpStations);
+    setLoaderCard(true, 'Online', 'present');
+    if (typeof SetupTab !== 'undefined') SetupTab.onConnected();
+  }
 });
 
 // Initialization progress
@@ -74,286 +85,280 @@ socket.on('initProgress', (data) => {
   const bar  = document.getElementById('initProgress');
   const log  = document.getElementById('initLog');
   if (wrap) wrap.style.display = 'block';
-  if (bar && data.pct != null) bar.value = data.pct;
-  if (log && data.message) {
-    log.textContent += data.message + '\n';
-    log.scrollTop = log.scrollHeight;
-  }
+  if (bar  && data.pct != null) bar.value = data.pct;
+  if (log  && data.message)     { log.textContent += data.message + '\n'; log.scrollTop = log.scrollHeight; }
 });
 
-// PCB Loader detected/removed
+// PCB Loader detected
 socket.on('loaderDetected', () => {
-  updateLoaderCard(true, 'Detected — initializing…', 'initializing');
-  logMonitoring('PCB Loader detected');
-  rebuildPnpCards([]);   // clear until init completes
+  AppState.loaderPresent = true;
+  setLoaderCard(false, 'Initializing…', 'initializing');
+  updateLoaderBadge(true);
+  appendMonitorLog('PCB Loader detected — starting initialization');
+  buildPnpCards([]);   // clear until init completes
+  const log = document.getElementById('initLog');
+  if (log) log.textContent = '';
+  const wrap = document.getElementById('progressBarWrap');
+  if (wrap) { wrap.style.display = 'block'; }
+  const bar = document.getElementById('initProgress');
+  if (bar) bar.value = 0;
 });
 
+// PCB Loader removed
 socket.on('loaderRemoved', () => {
-  updateLoaderCard(false, 'Not detected', 'absent');
+  AppState.loaderPresent     = false;
+  AppState.connected         = false;
+  AppState.availableStations = [];
+  AppState.pnpStations       = [];
+
+  setLoaderCard(false, 'Removed', 'absent');
   updateLoaderBadge(false);
+  updateConnectionBadge(false);
   updateSystemStatusBadge('idle');
-  logMonitoring('PCB Loader removed — stations in last mode');
-  rebuildPnpCards([]);
+  updateStatusBar('PCB Loader disconnected — waiting for reconnection…');
+  updateTabAccess(false);
+  buildPnpCards([]);
+  updateSysInfoTable();
+  appendMonitorLog('PCB Loader removed — stations set to last mode');
 });
 
-// Production events → OperationTab
+// Production events
 socket.on('productionStarted',  (d) => { if (typeof OperationTab !== 'undefined') OperationTab.onProductionStarted(d); });
 socket.on('productionStopped',  ()  => { if (typeof OperationTab !== 'undefined') OperationTab.onProductionStopped(); });
 socket.on('productionComplete', (d) => { if (typeof OperationTab !== 'undefined') OperationTab.onProductionComplete(d); });
 socket.on('pcbCompleted',       (d) => { if (typeof OperationTab !== 'undefined') OperationTab.onPcbCompleted(d); });
-socket.on('stateChange',        (d) => {
-  if (typeof OperationTab !== 'undefined')  OperationTab.onStateChange(d);
-  logMonitoring(`${d.stationName}: ${PlacementStatus.getName(d.oldStatus)} → ${d.statusName}`);
-  updatePnpCardStatus(d.slaveId, d.statusName, d.newStatus);
+
+socket.on('stateChange', (d) => {
+  if (typeof OperationTab !== 'undefined') OperationTab.onStateChange(d);
+  appendMonitorLog(`${d.stationName}: ${PlacementStatus.getName(d.oldStatus)} → ${d.statusName}`);
+  setPnpCardState(d.slaveId, d.statusName, d.newStatus);
 });
+
 socket.on('snapshot', (d) => {
   if (typeof OperationTab !== 'undefined') OperationTab.onSnapshot(d);
-  updateCardsFromSnapshot(d);
+  if (d && d.stationRows) {
+    d.stationRows.forEach((row) => {
+      if (row.slaveId === AppState.loaderStationId) {
+        const dotClass = row.status === 0 ? 'idle' : 'production';
+        setLoaderCard(true, row.statusName, dotClass);
+      } else {
+        setPnpCardState(row.slaveId, row.statusName, row.status);
+      }
+    });
+  }
 });
-socket.on('setupComplete', () => {
-  if (typeof OperationTab !== 'undefined') OperationTab.onSetupComplete();
-});
-socket.on('returnedToSetup', () => {
+
+socket.on('setupComplete',    () => { if (typeof OperationTab !== 'undefined') OperationTab.onSetupComplete(); });
+socket.on('returnedToSetup',  () => {
   setTabEnabled('setup', true);
   setTabEnabled('operation', false);
   updateSystemStatusBadge('ready');
 });
 socket.on('buttonPressed', () => {
-  logMonitoring('Physical start button pressed on PCB Loader');
+  appendMonitorLog('Physical start button pressed — production starting in 1 s');
   setTabEnabled('operation', true);
   switchTab('operation');
 });
 
-// ── Overview card helpers ─────────────────────────────────────────────────────
+// ── Apply full system state ───────────────────────────────────────────────────
 
-function updateLoaderCard(present, text, dotClass) {
-  const dot  = document.getElementById('loaderDot');
-  const txt  = document.getElementById('loaderStatusText');
-  const card = document.getElementById('loaderCard');
-  if (dot)  { dot.className = `indicator-dot ${dotClass}`; }
-  if (txt)  { txt.textContent = text; }
+function applySystemState(data) {
+  updateConnectionBadge(data.connected);
+  updateLoaderBadge(data.loaderPresent);
+  updateSystemStatusBadge(data.systemStatus);
+  updateStatusBar(data.statusMessage ?? '');
+  updateTabAccess(data.connected);
+  updateSysInfoTable();
+
+  if (data.connected && data.pnpStations?.length > 0) {
+    buildPnpCards(data.pnpStations);
+    setLoaderCard(true, 'Online', 'present');
+    if (typeof SetupTab !== 'undefined') SetupTab.onConnected();
+  } else if (!data.loaderPresent) {
+    setLoaderCard(false, 'Waiting…', 'absent');
+    buildPnpCards([]);
+  } else if (data.systemStatus === 'initializing') {
+    setLoaderCard(false, 'Initializing…', 'initializing');
+  }
 }
 
-function rebuildPnpCards(pnpIds) {
-  const container = document.getElementById('pnpCards');
-  if (!container) return;
-  container.innerHTML = '';
+// ── System info table ─────────────────────────────────────────────────────────
+
+function updateSysInfoTable() {
+  setText('si-port',   AppState.serialPort || '—');
+  setText('si-bus',    AppState.connected ? 'Connected' : 'Disconnected');
+  setText('si-loader', AppState.loaderPresent ? `Online (Slave ID ${AppState.loaderStationId})` : 'Absent');
+  setText('si-pnp',
+    AppState.pnpStations.length > 0
+      ? `${AppState.pnpStations.length} station(s): [${AppState.pnpStations.join(', ')}]`
+      : 'None detected'
+  );
+  setText('si-state', AppState.systemStatus.charAt(0).toUpperCase() + AppState.systemStatus.slice(1));
+}
+
+// ── Station card management ───────────────────────────────────────────────────
+
+function setLoaderCard(present, text, dotClass) {
+  const dot  = document.getElementById('dot-loader');
+  const txt  = document.getElementById('text-loader');
+  const card = document.getElementById('card-loader');
+  if (dot)  dot.className  = `indicator-dot ${dotClass}`;
+  if (txt)  txt.textContent = text;
+  if (card) {
+    card.className = 'station-card ' + (
+      dotClass === 'absent'       ? 'state-absent'     :
+      dotClass === 'initializing' ? 'state-init'       :
+      dotClass === 'production'   ? 'state-production' :
+      dotClass === 'error'        ? 'state-error'      :
+                                    'state-ready'
+    );
+  }
+}
+
+function buildPnpCards(pnpIds) {
+  const area = document.getElementById('pnpCardArea');
+  if (!area) return;
+  area.innerHTML = '';
 
   if (pnpIds.length === 0) {
     const ph = document.createElement('div');
-    ph.className = 'card status-card placeholder-card';
-    ph.innerHTML = '<p style="color:#999;text-align:center;margin-top:1rem">P&amp;P stations appear here after initialization</p>';
-    container.appendChild(ph);
+    ph.className = 'station-card placeholder-card';
+    ph.id        = 'pnpPlaceholder';
+    ph.innerHTML = `
+      <div class="station-card-body" style="text-align:center;color:#999;padding:1.5rem .5rem">
+        P&amp;P stations appear<br>after initialization
+      </div>`;
+    area.appendChild(ph);
     return;
   }
 
   pnpIds.forEach((sid) => {
     const card = document.createElement('div');
-    card.className = 'card status-card';
-    card.id = `pnp-card-${sid}`;
+    card.className = 'station-card state-ready';
+    card.id        = `card-pnp-${sid}`;
     card.innerHTML = `
-      <div class="status-card-header">
-        <span class="station-label">P&amp;P Station ${sid}</span>
-        <span class="station-id">Slave ID ${sid}</span>
+      <div class="station-card-header">
+        <span class="station-card-title">P&amp;P Station ${sid}</span>
+        <span class="station-card-id">Slave ID ${sid}</span>
       </div>
-      <div class="status-indicator">
-        <div class="indicator-dot ready" id="pnp-dot-${sid}"></div>
-        <span id="pnp-status-${sid}">Ready</span>
-      </div>
-    `;
-    container.appendChild(card);
+      <div class="station-card-body">
+        <div class="station-indicator">
+          <div class="indicator-dot ready" id="dot-pnp-${sid}"></div>
+          <span id="text-pnp-${sid}" class="indicator-label">Ready</span>
+        </div>
+      </div>`;
+    area.appendChild(card);
   });
 }
 
-function updatePnpCardStatus(slaveId, statusName, statusCode) {
-  const dot = document.getElementById(`pnp-dot-${slaveId}`);
-  const txt = document.getElementById(`pnp-status-${slaveId}`);
+function setPnpCardState(slaveId, statusName, statusCode) {
+  const dot  = document.getElementById(`dot-pnp-${slaveId}`);
+  const txt  = document.getElementById(`text-pnp-${slaveId}`);
+  const card = document.getElementById(`card-pnp-${slaveId}`);
   if (!dot || !txt) return;
+
   txt.textContent = statusName;
 
-  let dotClass = 'ready';
+  let dotClass   = 'idle';
+  let cardClass  = 'state-ready';
+
   switch (statusCode) {
-    case 0:  dotClass = 'ready';      break;
+    case 0:  dotClass = 'idle';       cardClass = 'state-ready';      break;
     case 3:
-    case 4:  dotClass = 'production'; break;
+    case 4:  dotClass = 'production'; cardClass = 'state-production'; break;
+    case 1:
+    case 2:
     case 6:
-    case 7:  dotClass = 'initializing'; break;
-    case 99: dotClass = 'error';      break;
-    default: dotClass = 'ready';
+    case 7:  dotClass = 'initializing'; cardClass = 'state-init';    break;
+    case 5:  dotClass = 'production';   cardClass = 'state-production'; break;
+    case 99: dotClass = 'error';        cardClass = 'state-error';    break;
   }
-  dot.className = `indicator-dot ${dotClass}`;
+
+  dot.className  = `indicator-dot ${dotClass}`;
+  if (card) card.className = `station-card ${cardClass}`;
 }
 
-function updateCardsFromSnapshot(snapshot) {
-  if (!snapshot || !snapshot.stationRows) return;
-  snapshot.stationRows.forEach((row) => {
-    if (row.slaveId === AppState.loaderStationId) {
-      updateLoaderCard(true, row.statusName, row.status === 0 ? 'present' : 'production');
-    } else {
-      updatePnpCardStatus(row.slaveId, row.statusName, row.status);
-    }
-  });
-}
-
-// Called when pnpStations are confirmed after init
-function onStationsInitialized() {
-  updateLoaderCard(true, 'Online', 'present');
-  updateLoaderBadge(true);
-  updateSystemStatusBadge('ready');
-  rebuildPnpCards(AppState.pnpStations);
-}
-
-// ── Badge / UI updates ────────────────────────────────────────────────────────
+// ── Badge / UI helpers ────────────────────────────────────────────────────────
 
 function updateConnectionBadge(connected) {
-  const badge = document.getElementById('connectionBadge');
-  if (!badge) return;
-  badge.textContent = connected ? 'Connected' : 'Disconnected';
-  badge.className   = `badge ${connected ? 'connected' : 'disconnected'}`;
-
-  // When connected, rebuild P&P cards
-  if (connected && AppState.pnpStations.length > 0) {
-    onStationsInitialized();
-  }
+  const el = document.getElementById('connectionBadge');
+  if (!el) return;
+  el.textContent = connected ? 'Connected' : 'Disconnected';
+  el.className   = `badge ${connected ? 'connected' : 'disconnected'}`;
 }
 
 function updateLoaderBadge(present) {
-  const badge = document.getElementById('loaderBadge');
-  if (!badge) return;
-  badge.textContent = `PCB Loader: ${present ? 'Present' : 'Absent'}`;
-  badge.className   = `badge ${present ? 'loader-present' : 'loader-absent'}`;
+  const el = document.getElementById('loaderBadge');
+  if (!el) return;
+  el.textContent = present ? 'Present' : 'Absent';
+  el.className   = `badge ${present ? 'loader-present' : 'loader-absent'}`;
 }
 
 function updateSystemStatusBadge(status) {
-  const badge = document.getElementById('systemStatusBadge');
-  if (!badge) return;
-  const labels = {
+  const el = document.getElementById('systemStatusBadge');
+  if (!el) return;
+  const label = {
+    connecting:   'Connecting…',
     idle:         'Idle',
-    initializing: 'Initializing…',
+    initializing: 'Initializing',
     ready:        'Ready',
     production:   'Production',
     error:        'Error',
   };
-  badge.textContent = labels[status] ?? status;
-  badge.className   = `badge status-${status}`;
+  el.textContent = label[status] ?? status;
+  el.className   = `badge status-${status}`;
 }
 
-function updateStatusBar(message) {
+function updateStatusBar(msg) {
   const el = document.getElementById('statusBarText');
-  if (el) el.textContent = message;
+  if (el) el.textContent = msg;
 }
 
 function updateTabAccess(connected) {
   ['setup', 'configuration', 'monitoring'].forEach((t) => setTabEnabled(t, connected));
-  setTabEnabled('operation', false);
-}
-
-// ── Port selector ─────────────────────────────────────────────────────────────
-
-async function refreshPorts() {
-  const sel = document.getElementById('portSelect');
-  const btn = document.getElementById('connectPortBtn');
-  if (!sel) return;
-  sel.innerHTML = '';
-  try {
-    const ports = await apiGet('/api/ports');
-    if (ports.length === 0) {
-      sel.innerHTML = '<option value="">No ports available</option>';
-      if (btn) btn.disabled = true;
-    } else {
-      ports.forEach((p) => {
-        const opt = document.createElement('option');
-        opt.value       = p.path;
-        opt.textContent = `${p.path} – ${p.friendlyName ?? p.manufacturer ?? ''}`;
-        sel.appendChild(opt);
-      });
-      if (btn) btn.disabled = false;
-    }
-  } catch (err) {
-    console.error('Failed to fetch ports:', err.message);
-  }
-}
-
-async function connectPort() {
-  const sel = document.getElementById('portSelect');
-  const port = sel?.value;
-  if (!port) { alert('No port selected'); return; }
-
-  const btn  = document.getElementById('connectPortBtn');
-  const disc = document.getElementById('disconnectBtn');
-  if (btn)  btn.disabled  = true;
-  if (disc) disc.disabled = false;
-
-  updateStatusBar(`Connecting to ${port}…`);
-
-  // Clear init log
-  const log = document.getElementById('initLog');
-  if (log) log.textContent = '';
-  const wrap = document.getElementById('progressBarWrap');
-  if (wrap) wrap.style.display = 'none';
-
-  try {
-    const result = await apiPost('/api/connect', { port });
-    if (result.error) throw new Error(result.error);
-    updateStatusBar(`Port ${port} open — watching for PCB Loader (Slave ID 5)…`);
-  } catch (err) {
-    updateStatusBar(`Connection failed: ${err.message}`);
-    if (btn)  btn.disabled  = false;
-    if (disc) disc.disabled = true;
-  }
-}
-
-async function disconnectPort() {
-  await apiPost('/api/disconnect', {});
-  const btn  = document.getElementById('connectPortBtn');
-  const disc = document.getElementById('disconnectBtn');
-  if (btn)  btn.disabled  = false;
-  if (disc) disc.disabled = true;
-  updateConnectionBadge(false);
-  updateLoaderBadge(false);
-  updateSystemStatusBadge('idle');
-  updateStatusBar('Disconnected');
-  updateTabAccess(false);
-  switchTab('overview');
-  updateLoaderCard(false, 'Not detected', 'absent');
-  rebuildPnpCards([]);
-  const wrap = document.getElementById('progressBarWrap');
-  if (wrap) wrap.style.display = 'none';
+  if (!connected) setTabEnabled('operation', false);
 }
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 
-function switchTab(tabName) {
+function switchTab(name) {
   document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach((b)  => b.classList.remove('active'));
-  const panel = document.getElementById(`tab-${tabName}`);
-  const btn   = document.querySelector(`[data-tab="${tabName}"]`);
+  const panel = document.getElementById(`tab-${name}`);
+  const btn   = document.querySelector(`[data-tab="${name}"]`);
   if (panel) panel.classList.add('active');
   if (btn)   btn.classList.add('active');
 
-  if (tabName === 'monitoring' && AppState.connected) {
+  if (name === 'monitoring' && AppState.connected) {
     if (typeof MonitoringTab !== 'undefined') MonitoringTab.startPolling();
   } else {
     if (typeof MonitoringTab !== 'undefined') MonitoringTab.stopPolling();
   }
 }
 
-function setTabEnabled(tabName, enabled) {
-  const btn = document.querySelector(`[data-tab="${tabName}"]`);
+function setTabEnabled(name, enabled) {
+  const btn = document.querySelector(`[data-tab="${name}"]`);
   if (btn) btn.disabled = !enabled;
 }
 
-// ── Monitoring event log helper ───────────────────────────────────────────────
-
-function logMonitoring(message) {
-  if (typeof MonitoringTab !== 'undefined') MonitoringTab.logEvent(message);
-}
-
-// ── LED slider ────────────────────────────────────────────────────────────────
+// ── LED slider label ──────────────────────────────────────────────────────────
 
 function updateLedLabel(key, value) {
   const el = document.getElementById(`led-${key}-val`);
   if (el) el.textContent = value;
+}
+
+// ── Monitoring log ────────────────────────────────────────────────────────────
+
+function appendMonitorLog(message) {
+  if (typeof MonitoringTab !== 'undefined') MonitoringTab.logEvent(message);
+}
+
+// ── DOM helpers ───────────────────────────────────────────────────────────────
+
+function setText(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -378,28 +383,24 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Tab buttons
   document.querySelectorAll('.tab-btn').forEach((btn) => {
-    btn.addEventListener('click', () => { if (!btn.disabled) switchTab(btn.dataset.tab); });
+    btn.addEventListener('click', () => {
+      if (!btn.disabled) switchTab(btn.dataset.tab);
+    });
   });
 
-  // Port controls
-  document.getElementById('refreshPortsBtn')?.addEventListener('click', refreshPorts);
-  document.getElementById('connectPortBtn')?.addEventListener('click', connectPort);
-  document.getElementById('disconnectBtn')?.addEventListener('click', disconnectPort);
-
-  // Operation tab
+  // Operation tab buttons
   document.getElementById('stopProductionBtn')?.addEventListener('click', async () => {
     if (!confirm('Stop production?')) return;
-    await apiPost('/api/operation/stop', {});
+    const res = await apiPost('/api/operation/stop', {});
+    if (res.error) alert(`Error: ${res.error}`);
   });
 
   document.getElementById('setPcbsBtn')?.addEventListener('click', async () => {
     const val = parseInt(document.getElementById('totalPcbsInput')?.value ?? '10');
-    if (val > 0) {
-      await apiPost('/api/operation/set-total', { totalPcbs: val });
-    }
+    if (val > 0) await apiPost('/api/operation/set-total', { totalPcbs: val });
   });
 
-  // Configuration tab
+  // Configuration tab buttons
   document.getElementById('readConfigBtn')?.addEventListener('click',  readConfiguration);
   document.getElementById('writeConfigBtn')?.addEventListener('click', writeConfiguration);
   document.getElementById('softResetBtn')?.addEventListener('click',   softResetAll);
@@ -418,15 +419,12 @@ document.addEventListener('DOMContentLoaded', () => {
       rfidBody.appendChild(tr);
     }
   }
-
-  // Initial port list
-  refreshPorts();
 });
 
-// ── Configuration functions ───────────────────────────────────────────────────
+// ── Configuration helpers ─────────────────────────────────────────────────────
 
 async function readConfiguration() {
-  if (!AppState.connected) { alert('Not connected to any stations'); return; }
+  if (!AppState.connected) { alert('No stations connected'); return; }
   try {
     const cfg = await apiGet('/api/configuration');
     if (cfg.timing) {
@@ -446,18 +444,22 @@ async function readConfiguration() {
     }
     if (cfg.rfid) {
       cfg.rfid.forEach((box, i) => {
-        setVal(`rfid-uid-high-${i}`, `0x${box.uidHigh.toString(16).toUpperCase().padStart(8,'0')}`);
-        setVal(`rfid-uid-low-${i}`,  `0x${box.uidLow.toString(16).toUpperCase().padStart(8,'0')}`);
-        setVal(`rfid-count-${i}`,    box.count);
+        setVal(`rfid-uid-high-${i}`,
+          `0x${box.uidHigh.toString(16).toUpperCase().padStart(8, '0')}`);
+        setVal(`rfid-uid-low-${i}`,
+          `0x${box.uidLow.toString(16).toUpperCase().padStart(8, '0')}`);
+        setVal(`rfid-count-${i}`, box.count);
       });
     }
     if (cfg.volume != null) setRng('audio-volume', cfg.volume, 'audio-vol-val');
     alert('Configuration read from stations');
-  } catch (err) { alert(`Read failed: ${err.message}`); }
+  } catch (err) {
+    alert(`Read failed: ${err.message}`);
+  }
 }
 
 async function writeConfiguration() {
-  if (!AppState.connected) { alert('Not connected'); return; }
+  if (!AppState.connected) { alert('No stations connected'); return; }
   if (!confirm('Write configuration to all stations?')) return;
   const rfid = Array.from({ length: 4 }, (_, i) => ({
     uidHigh: parseInt(document.getElementById(`rfid-uid-high-${i}`)?.value ?? '0', 16) || 0,
@@ -466,13 +468,15 @@ async function writeConfiguration() {
   }));
   const body = {
     timing: {
-      transistor: getNum('timing-transistor'), diode:    getNum('timing-diode'),
-      ic:         getNum('timing-ic'),         capacitor:getNum('timing-capacitor'),
+      transistor: getNum('timing-transistor'), diode:     getNum('timing-diode'),
+      ic:         getNum('timing-ic'),         capacitor: getNum('timing-capacitor'),
       transport:  getNum('timing-transport'),
     },
     led: {
-      red: getNum('led-red'), yellow: getNum('led-yellow'), green: getNum('led-green'),
-      rgb: getNum('led-rgb'), thresholdYellow: getNum('thresh-yellow'), thresholdRed: getNum('thresh-red'),
+      red:             getNum('led-red'),    yellow: getNum('led-yellow'),
+      green:           getNum('led-green'),  rgb:    getNum('led-rgb'),
+      thresholdYellow: getNum('thresh-yellow'),
+      thresholdRed:    getNum('thresh-red'),
     },
     rfid,
     volume: getNum('audio-volume'),
@@ -481,19 +485,32 @@ async function writeConfiguration() {
     const res = await apiPost('/api/configuration', body);
     if (res.error) throw new Error(res.error);
     alert('Configuration written to all stations');
-  } catch (err) { alert(`Write failed: ${err.message}`); }
+  } catch (err) {
+    alert(`Write failed: ${err.message}`);
+  }
 }
 
 async function softResetAll() {
-  if (!AppState.connected) { alert('Not connected'); return; }
-  if (!confirm('Soft reset ALL stations? Any PCBs being processed may be lost.')) return;
+  if (!AppState.connected) { alert('No stations connected'); return; }
+  if (!confirm('Soft reset ALL stations?\nAny PCBs being processed may be lost.')) return;
   try {
     const res = await apiPost('/api/configuration/soft-reset', {});
     if (res.error) throw new Error(res.error);
     alert('All stations reset successfully');
-  } catch (err) { alert(`Reset failed: ${err.message}`); }
+  } catch (err) {
+    alert(`Reset failed: ${err.message}`);
+  }
 }
 
-function setVal(id, val) { const el = document.getElementById(id); if (el) el.value = val; }
-function setRng(id, val, lblId) { setVal(id, val); setVal(lblId, val); }
-function getNum(id) { return parseInt(document.getElementById(id)?.value ?? '0') || 0; }
+function setVal(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.value = val;
+}
+function setRng(id, val, lblId) {
+  setVal(id, val);
+  const lbl = document.getElementById(lblId);
+  if (lbl) lbl.textContent = val;
+}
+function getNum(id) {
+  return parseInt(document.getElementById(id)?.value ?? '0') || 0;
+}

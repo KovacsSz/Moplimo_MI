@@ -1,6 +1,5 @@
 /**
  * Setup Tab controller
- * Polls station component distribution and manages start-button state
  */
 
 'use strict';
@@ -16,6 +15,7 @@ const SetupTab = (() => {
   const distBody = ()    => document.querySelector('#distributionTable tbody');
 
   function onConnected() {
+    wasReady = false;
     buildDistributionTable();
     startPolling();
   }
@@ -27,7 +27,8 @@ const SetupTab = (() => {
     AppState.pnpStations.forEach((sid) => {
       const tr = document.createElement('tr');
       tr.id = `dist-row-${sid}`;
-      tr.innerHTML = `<td>P&amp;P Station ${sid}</td>` +
+      tr.innerHTML =
+        `<td>P&amp;P Station ${sid}</td>` +
         KEYS.map((k) => `<td id="dist-${sid}-${k}">0</td>`).join('');
       tbody.appendChild(tr);
     });
@@ -48,7 +49,7 @@ const SetupTab = (() => {
     try {
       const data = await apiGet('/api/setup/components');
       updateUI(data);
-    } catch { /* ignore */ }
+    } catch { /* transient errors ignored */ }
   }
 
   function updateUI(data) {
@@ -60,10 +61,9 @@ const SetupTab = (() => {
 
     // Distribution table
     AppState.pnpStations.forEach((sid, idx) => {
-      const placed = allPlaced[idx];
       KEYS.forEach((k) => {
         const cell = document.getElementById(`dist-${sid}-${k}`);
-        if (cell) cell.textContent = placed[k] ?? 0;
+        if (cell) cell.textContent = allPlaced[idx][k] ?? 0;
       });
     });
 
@@ -79,9 +79,9 @@ const SetupTab = (() => {
         (available[k] < 0 ? ' negative' : available[k] === 0 ? ' zero' : '');
     });
 
-    // Write total positions back to stations
+    // Write total positions back to each station
     AppState.pnpStations.forEach((sid, idx) => {
-      const otherSum   = KEYS.map((k, ki) => totalAssigned[ki] - (allPlaced[idx][k] ?? 0));
+      const otherSum     = KEYS.map((k, ki) => totalAssigned[ki] - (allPlaced[idx][k] ?? 0));
       const stationTotal = KEYS.map((k, ki) => Math.max(0, TOTAL[k] - otherSum[ki]));
       apiPost('/api/setup/total-positions', {
         slaveId:     sid,
@@ -93,9 +93,7 @@ const SetupTab = (() => {
     });
 
     // Ready check
-    const allZero   = KEYS.every((k) => available[k] === 0);
-    const allNonNeg = KEYS.every((k) => available[k] >= 0);
-    const ready     = allZero && allNonNeg;
+    const ready = KEYS.every((k) => available[k] === 0);
 
     if (ready && !wasReady) {
       setTabEnabled('operation', true);

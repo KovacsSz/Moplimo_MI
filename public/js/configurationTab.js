@@ -5,133 +5,95 @@
 'use strict';
 
 const ConfigurationTab = (() => {
+
   document.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('readConfigBtn').addEventListener('click', readConfiguration);
-    document.getElementById('writeConfigBtn').addEventListener('click', writeConfiguration);
-    document.getElementById('softResetBtn').addEventListener('click', softReset);
+    document.getElementById('readConfigBtn') ?.addEventListener('click', readConfiguration);
+    document.getElementById('writeConfigBtn')?.addEventListener('click', writeConfiguration);
+    document.getElementById('softResetBtn')  ?.addEventListener('click', softReset);
   });
 
-  // ── Read ──────────────────────────────────────────────────────────────────
   async function readConfiguration() {
-    if (!AppState.connected) { alert('Not connected to any stations'); return; }
+    if (!AppState.connected) { alert('No stations connected'); return; }
     try {
       const cfg = await apiGet('/api/configuration');
-
       if (cfg.timing) {
-        setValue('timing-transistor', cfg.timing.transistor);
-        setValue('timing-diode',      cfg.timing.diode);
-        setValue('timing-ic',         cfg.timing.ic);
-        setValue('timing-capacitor',  cfg.timing.capacitor);
-        setValue('timing-transport',  cfg.timing.transport);
+        setVal('timing-transistor', cfg.timing.transistor);
+        setVal('timing-diode',      cfg.timing.diode);
+        setVal('timing-ic',         cfg.timing.ic);
+        setVal('timing-capacitor',  cfg.timing.capacitor);
+        setVal('timing-transport',  cfg.timing.transport);
       }
-
       if (cfg.led) {
-        setRange('led-red',    cfg.led.red,    'led-red-val');
-        setRange('led-yellow', cfg.led.yellow, 'led-yellow-val');
-        setRange('led-green',  cfg.led.green,  'led-green-val');
-        setRange('led-rgb',    cfg.led.rgb,    'led-rgb-val');
-        setValue('thresh-yellow', cfg.led.thresholdYellow);
-        setValue('thresh-red',    cfg.led.thresholdRed);
+        setRng('led-red',    cfg.led.red,    'led-red-val');
+        setRng('led-yellow', cfg.led.yellow, 'led-yellow-val');
+        setRng('led-green',  cfg.led.green,  'led-green-val');
+        setRng('led-rgb',    cfg.led.rgb,    'led-rgb-val');
+        setVal('thresh-yellow', cfg.led.thresholdYellow);
+        setVal('thresh-red',    cfg.led.thresholdRed);
       }
-
       if (cfg.rfid) {
         cfg.rfid.forEach((box, i) => {
-          setValue(`rfid-uid-high-${i}`, `0x${box.uidHigh.toString(16).toUpperCase().padStart(8, '0')}`);
-          setValue(`rfid-uid-low-${i}`,  `0x${box.uidLow.toString(16).toUpperCase().padStart(8, '0')}`);
-          setValue(`rfid-count-${i}`,    box.count);
+          setVal(`rfid-uid-high-${i}`,
+            `0x${box.uidHigh.toString(16).toUpperCase().padStart(8,'0')}`);
+          setVal(`rfid-uid-low-${i}`,
+            `0x${box.uidLow.toString(16).toUpperCase().padStart(8,'0')}`);
+          setVal(`rfid-count-${i}`, box.count);
         });
       }
-
-      if (cfg.volume != null) {
-        setRange('audio-volume', cfg.volume, 'audio-vol-val');
-      }
-
-      alert(`Configuration read from P&P Station ${AppState.pnpStations[0]}`);
-    } catch (err) {
-      alert(`Failed to read configuration: ${err.message}`);
-    }
+      if (cfg.volume != null) setRng('audio-volume', cfg.volume, 'audio-vol-val');
+      alert('Configuration read successfully');
+    } catch (err) { alert(`Read failed: ${err.message}`); }
   }
 
-  // ── Write ─────────────────────────────────────────────────────────────────
   async function writeConfiguration() {
-    if (!AppState.connected) { alert('Not connected'); return; }
+    if (!AppState.connected) { alert('No stations connected'); return; }
     if (!confirm('Write configuration to all stations?')) return;
-
-    const rfid = Array.from({ length: 4 }, (_, i) => {
-      const highStr = document.getElementById(`rfid-uid-high-${i}`)?.value ?? '0';
-      const lowStr  = document.getElementById(`rfid-uid-low-${i}`)?.value  ?? '0';
-      return {
-        uidHigh: parseInt(highStr, 16) || 0,
-        uidLow:  parseInt(lowStr,  16) || 0,
-        count:   parseInt(document.getElementById(`rfid-count-${i}`)?.value ?? '0') || 0,
-      };
-    });
-
+    const rfid = Array.from({ length: 4 }, (_, i) => ({
+      uidHigh: parseInt(document.getElementById(`rfid-uid-high-${i}`)?.value ?? '0', 16) || 0,
+      uidLow:  parseInt(document.getElementById(`rfid-uid-low-${i}`)?.value  ?? '0', 16) || 0,
+      count:   parseInt(document.getElementById(`rfid-count-${i}`)?.value    ?? '0') || 0,
+    }));
     const body = {
       timing: {
-        transistor: getNumber('timing-transistor'),
-        diode:      getNumber('timing-diode'),
-        ic:         getNumber('timing-ic'),
-        capacitor:  getNumber('timing-capacitor'),
-        transport:  getNumber('timing-transport'),
+        transistor: getNum('timing-transistor'), diode:     getNum('timing-diode'),
+        ic:         getNum('timing-ic'),         capacitor: getNum('timing-capacitor'),
+        transport:  getNum('timing-transport'),
       },
       led: {
-        red:            getNumber('led-red'),
-        yellow:         getNumber('led-yellow'),
-        green:          getNumber('led-green'),
-        rgb:            getNumber('led-rgb'),
-        thresholdYellow: getNumber('thresh-yellow'),
-        thresholdRed:    getNumber('thresh-red'),
+        red:             getNum('led-red'),    yellow: getNum('led-yellow'),
+        green:           getNum('led-green'),  rgb:    getNum('led-rgb'),
+        thresholdYellow: getNum('thresh-yellow'),
+        thresholdRed:    getNum('thresh-red'),
       },
       rfid,
-      volume: getNumber('audio-volume'),
+      volume: getNum('audio-volume'),
     };
-
     try {
       const res = await apiPost('/api/configuration', body);
       if (res.error) throw new Error(res.error);
-      alert(`Configuration written to all ${AppState.availableStations.length} stations`);
-    } catch (err) {
-      alert(`Failed to write configuration: ${err.message}`);
-    }
+      alert('Configuration written to all stations');
+    } catch (err) { alert(`Write failed: ${err.message}`); }
   }
 
-  // ── Soft Reset ────────────────────────────────────────────────────────────
   async function softReset() {
-    if (!AppState.connected) { alert('Not connected'); return; }
+    if (!AppState.connected) { alert('No stations connected'); return; }
     if (!confirm(
-      'This will soft reset ALL stations.\n\n' +
-      'Stations will stop, reset to initial state, and return to setup page.\n\n' +
-      'Any PCBs being processed may be lost.\n\nContinue?'
+      'Soft reset ALL stations?\nAny PCBs being processed may be lost.\nContinue?'
     )) return;
-
     try {
       const res = await apiPost('/api/configuration/soft-reset', {});
       if (res.error) throw new Error(res.error);
-      alert(`All ${AppState.availableStations.length} stations reset successfully.`);
-    } catch (err) {
-      alert(`Failed to reset stations: ${err.message}`);
-    }
+      alert('All stations reset successfully');
+    } catch (err) { alert(`Reset failed: ${err.message}`); }
   }
 
-  // ── DOM helpers ───────────────────────────────────────────────────────────
-  function setValue(id, val) {
-    const el = document.getElementById(id);
-    if (el) el.value = val;
+  function setVal(id, val) { const el = document.getElementById(id); if (el) el.value = val; }
+  function setRng(id, val, lblId) {
+    setVal(id, val);
+    const lbl = document.getElementById(lblId);
+    if (lbl) lbl.textContent = val;
   }
-
-  function setRange(id, val, labelId) {
-    const el = document.getElementById(id);
-    if (el) { el.value = val; }
-    if (labelId) {
-      const lbl = document.getElementById(labelId);
-      if (lbl) lbl.textContent = val;
-    }
-  }
-
-  function getNumber(id) {
-    return parseInt(document.getElementById(id)?.value ?? '0') || 0;
-  }
+  function getNum(id) { return parseInt(document.getElementById(id)?.value ?? '0') || 0; }
 
   return {};
 })();
