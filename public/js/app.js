@@ -1,7 +1,5 @@
 /**
  * Main application controller — visualization only
- * No connect/disconnect controls in the GUI.
- * Server auto-connects; PCB Loader watch handles everything.
  */
 
 'use strict';
@@ -49,7 +47,7 @@ socket.on('disconnect', () => {
   appendMonitorLog('Disconnected from server');
 });
 
-// Full system state
+// Full system state (sent on connect and on every status change)
 socket.on('systemState', (data) => {
   AppState.connected         = data.connected;
   AppState.availableStations = data.availableStations ?? [];
@@ -58,20 +56,17 @@ socket.on('systemState', (data) => {
   AppState.systemStatus      = data.systemStatus       ?? 'idle';
   AppState.loaderPresent     = data.loaderPresent      ?? false;
   AppState.serialPort        = data.serialPort         ?? '—';
-
   applySystemState(data);
 });
 
-// Legacy connectionState
+// Legacy connectionState (also emitted by server)
 socket.on('connectionState', (data) => {
   AppState.connected         = data.connected;
   AppState.availableStations = data.availableStations ?? [];
   AppState.pnpStations       = data.pnpStations        ?? [];
-
   updateConnectionBadge(data.connected);
   updateTabAccess(data.connected);
   updateSysInfoTable();
-
   if (data.connected) {
     buildPnpCards(AppState.pnpStations);
     setLoaderCard(true, 'Online', 'present');
@@ -86,7 +81,10 @@ socket.on('initProgress', (data) => {
   const log  = document.getElementById('initLog');
   if (wrap) wrap.style.display = 'block';
   if (bar  && data.pct != null) bar.value = data.pct;
-  if (log  && data.message)     { log.textContent += data.message + '\n'; log.scrollTop = log.scrollHeight; }
+  if (log  && data.message) {
+    log.textContent += data.message + '\n';
+    log.scrollTop = log.scrollHeight;
+  }
 });
 
 // PCB Loader detected
@@ -95,11 +93,11 @@ socket.on('loaderDetected', () => {
   setLoaderCard(false, 'Initializing…', 'initializing');
   updateLoaderBadge(true);
   appendMonitorLog('PCB Loader detected — starting initialization');
-  buildPnpCards([]);   // clear until init completes
+  buildPnpCards([]);
   const log = document.getElementById('initLog');
   if (log) log.textContent = '';
   const wrap = document.getElementById('progressBarWrap');
-  if (wrap) { wrap.style.display = 'block'; }
+  if (wrap) wrap.style.display = 'block';
   const bar = document.getElementById('initProgress');
   if (bar) bar.value = 0;
 });
@@ -110,7 +108,6 @@ socket.on('loaderRemoved', () => {
   AppState.connected         = false;
   AppState.availableStations = [];
   AppState.pnpStations       = [];
-
   setLoaderCard(false, 'Removed', 'absent');
   updateLoaderBadge(false);
   updateConnectionBadge(false);
@@ -120,17 +117,39 @@ socket.on('loaderRemoved', () => {
   buildPnpCards([]);
   updateSysInfoTable();
   appendMonitorLog('PCB Loader removed — stations set to last mode');
+  if (typeof SetupTab !== 'undefined') SetupTab.stopPolling();
 });
 
-// Production events
-socket.on('productionStarted',  (d) => { if (typeof OperationTab !== 'undefined') OperationTab.onProductionStarted(d); });
-socket.on('productionStopped',  ()  => { if (typeof OperationTab !== 'undefined') OperationTab.onProductionStopped(); });
-socket.on('productionComplete', (d) => { if (typeof OperationTab !== 'undefined') OperationTab.onProductionComplete(d); });
-socket.on('pcbCompleted',       (d) => { if (typeof OperationTab !== 'undefined') OperationTab.onPcbCompleted(d); });
+// ── Production events ─────────────────────────────────────────────────────────
+
+socket.on('productionStarted', (d) => {
+  updateSystemStatusBadge('production');
+  updateStatusBar(`Production running — ${d.totalPcbs} PCBs`);
+  if (typeof OperationTab !== 'undefined') OperationTab.onProductionStarted(d);
+});
+
+socket.on('productionStopped', () => {
+  updateSystemStatusBadge('ready');
+  updateStatusBar('Production stopped');
+  if (typeof OperationTab !== 'undefined') OperationTab.onProductionStopped();
+  // returnedToSetup will follow immediately from the server
+});
+
+socket.on('productionComplete', (d) => {
+  updateStatusBar(`Production complete — ${d.totalPcbs} PCBs done`);
+  if (typeof OperationTab !== 'undefined') OperationTab.onProductionComplete(d);
+  // returnedToSetup will follow immediately from the server
+});
+
+socket.on('pcbCompleted', (d) => {
+  if (typeof OperationTab !== 'undefined') OperationTab.onPcbCompleted(d);
+});
 
 socket.on('stateChange', (d) => {
   if (typeof OperationTab !== 'undefined') OperationTab.onStateChange(d);
-  appendMonitorLog(`${d.stationName}: ${PlacementStatus.getName(d.oldStatus)} → ${d.statusName}`);
+  appendMonitorLog(
+    `${d.stationName}: ${PlacementStatus.getName(d.oldStatus)} → ${d.statusName}`
+  );
   setPnpCardState(d.slaveId, d.statusName, d.newStatus);
 });
 
@@ -139,8 +158,7 @@ socket.on('snapshot', (d) => {
   if (d && d.stationRows) {
     d.stationRows.forEach((row) => {
       if (row.slaveId === AppState.loaderStationId) {
-        const dotClass = row.status === 0 ? 'idle' : 'production';
-        setLoaderCard(true, row.statusName, dotClass);
+        setLoaderCard(true, row.statusName, row.status === 0 ? 'idle' : 'production');
       } else {
         setPnpCardState(row.slaveId, row.statusName, row.status);
       }
@@ -148,19 +166,68 @@ socket.on('snapshot', (d) => {
   }
 });
 
-socket.on('setupComplete',    () => { if (typeof OperationTab !== 'undefined') OperationTab.onSetupComplete(); });
-socket.on('returnedToSetup',  () => {
+socket.on('setupComplete', () => {
+  if (typeof OperationTab !== 'undefined') OperationTab.onSetupComplete();
+});
+
+// ── returnedToSetup ───────────────────────────────────────────────────────────
+//
+// Fired by the server after _returnToSetup() completes.
+// At this point the hardware already has:
+//   - Coil 17 = false  (start button inactive)
+//   - Holding reg 0 = 1 (Setup page) on all stations
+//   - Holding regs 2-3-4-5 = 5,4,3,2 (defaults) on all stations
+//
+// The GUI must:
+//   1. Switch to Setup tab
+//   2. Reset the distribution display to "nothing assigned"
+//   3. Disable Operation tab until distribution is done again
+//   4. Update badges / status bar
+//   5. Keep Setup polling running so operator can redistribute immediately
+//
+socket.on('returnedToSetup', () => {
+  console.log('[App] returnedToSetup received');
+
+  // 1. Update status indicators
+  updateSystemStatusBadge('ready');
+  updateStatusBar(
+    'Setup mode — distribute components on each station, then press the physical start button'
+  );
+
+  // 2. Ensure Setup tab is accessible, Operation tab is locked
   setTabEnabled('setup', true);
   setTabEnabled('operation', false);
-  updateSystemStatusBadge('ready');
+
+  // 3. Switch to Setup tab
+  switchTab('setup');
+
+  // 4. Reset station cards to idle / ready state
+  AppState.pnpStations.forEach((sid) => {
+    setPnpCardState(sid, 'IDLE_WAITING_FOR_NEW_PCB', 0);
+  });
+  setLoaderCard(true, 'Setup mode — ready', 'ready');
+
+  // 5. Tell SetupTab to reset its display and resume polling
+  //    This shows available = 5,4,3,2 and distribution = 0
+  //    and re-arms the ready-check so the next batch can start
+  if (typeof SetupTab !== 'undefined') {
+    SetupTab.onReturnedToSetup();
+  }
+
+  appendMonitorLog('All stations returned to setup mode — ready for next batch');
+  updateSysInfoTable();
 });
+
+// ── buttonPressed ─────────────────────────────────────────────────────────────
+
 socket.on('buttonPressed', () => {
   appendMonitorLog('Physical start button pressed — production starting in 1 s');
+  updateStatusBar('Starting production…');
   setTabEnabled('operation', true);
   switchTab('operation');
 });
 
-// ── Apply full system state ───────────────────────────────────────────────────
+// ── applySystemState ──────────────────────────────────────────────────────────
 
 function applySystemState(data) {
   updateConnectionBadge(data.connected);
@@ -187,13 +254,16 @@ function applySystemState(data) {
 function updateSysInfoTable() {
   setText('si-port',   AppState.serialPort || '—');
   setText('si-bus',    AppState.connected ? 'Connected' : 'Disconnected');
-  setText('si-loader', AppState.loaderPresent ? `Online (Slave ID ${AppState.loaderStationId})` : 'Absent');
+  setText('si-loader', AppState.loaderPresent
+    ? `Online (Slave ID ${AppState.loaderStationId})` : 'Absent');
   setText('si-pnp',
     AppState.pnpStations.length > 0
       ? `${AppState.pnpStations.length} station(s): [${AppState.pnpStations.join(', ')}]`
       : 'None detected'
   );
-  setText('si-state', AppState.systemStatus.charAt(0).toUpperCase() + AppState.systemStatus.slice(1));
+  setText('si-state',
+    AppState.systemStatus.charAt(0).toUpperCase() + AppState.systemStatus.slice(1)
+  );
 }
 
 // ── Station card management ───────────────────────────────────────────────────
@@ -202,7 +272,7 @@ function setLoaderCard(present, text, dotClass) {
   const dot  = document.getElementById('dot-loader');
   const txt  = document.getElementById('text-loader');
   const card = document.getElementById('card-loader');
-  if (dot)  dot.className  = `indicator-dot ${dotClass}`;
+  if (dot)  dot.className   = `indicator-dot ${dotClass}`;
   if (txt)  txt.textContent = text;
   if (card) {
     card.className = 'station-card ' + (
@@ -223,9 +293,9 @@ function buildPnpCards(pnpIds) {
   if (pnpIds.length === 0) {
     const ph = document.createElement('div');
     ph.className = 'station-card placeholder-card';
-    ph.id        = 'pnpPlaceholder';
     ph.innerHTML = `
-      <div class="station-card-body" style="text-align:center;color:#999;padding:1.5rem .5rem">
+      <div class="station-card-body"
+           style="text-align:center;color:#999;padding:1.5rem .5rem">
         P&amp;P stations appear<br>after initialization
       </div>`;
     area.appendChild(ph);
@@ -259,26 +329,24 @@ function setPnpCardState(slaveId, statusName, statusCode) {
 
   txt.textContent = statusName;
 
-  let dotClass   = 'idle';
-  let cardClass  = 'state-ready';
-
+  let dotClass  = 'idle';
+  let cardClass = 'state-ready';
   switch (statusCode) {
-    case 0:  dotClass = 'idle';       cardClass = 'state-ready';      break;
+    case 0:  dotClass = 'idle';         cardClass = 'state-ready';      break;
     case 3:
-    case 4:  dotClass = 'production'; cardClass = 'state-production'; break;
+    case 4:  dotClass = 'production';   cardClass = 'state-production'; break;
     case 1:
     case 2:
     case 6:
-    case 7:  dotClass = 'initializing'; cardClass = 'state-init';    break;
+    case 7:  dotClass = 'initializing'; cardClass = 'state-init';       break;
     case 5:  dotClass = 'production';   cardClass = 'state-production'; break;
-    case 99: dotClass = 'error';        cardClass = 'state-error';    break;
+    case 99: dotClass = 'error';        cardClass = 'state-error';      break;
   }
-
   dot.className  = `indicator-dot ${dotClass}`;
   if (card) card.className = `station-card ${cardClass}`;
 }
 
-// ── Badge / UI helpers ────────────────────────────────────────────────────────
+// ── Badge / status helpers ────────────────────────────────────────────────────
 
 function updateConnectionBadge(connected) {
   const el = document.getElementById('connectionBadge');
@@ -297,7 +365,7 @@ function updateLoaderBadge(present) {
 function updateSystemStatusBadge(status) {
   const el = document.getElementById('systemStatusBadge');
   if (!el) return;
-  const label = {
+  const labels = {
     connecting:   'Connecting…',
     idle:         'Idle',
     initializing: 'Initializing',
@@ -305,7 +373,7 @@ function updateSystemStatusBadge(status) {
     production:   'Production',
     error:        'Error',
   };
-  el.textContent = label[status] ?? status;
+  el.textContent = labels[status] ?? status;
   el.className   = `badge status-${status}`;
 }
 
@@ -381,29 +449,33 @@ async function apiGet(url) {
 
 document.addEventListener('DOMContentLoaded', () => {
 
-  // Tab buttons
+  // Tab navigation
   document.querySelectorAll('.tab-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       if (!btn.disabled) switchTab(btn.dataset.tab);
     });
   });
 
-  // Operation tab buttons
-  document.getElementById('stopProductionBtn')?.addEventListener('click', async () => {
-    if (!confirm('Stop production?')) return;
-    const res = await apiPost('/api/operation/stop', {});
-    if (res.error) alert(`Error: ${res.error}`);
-  });
+  // Operation tab
+  document.getElementById('stopProductionBtn')
+    ?.addEventListener('click', async () => {
+      if (!confirm('Stop production?')) return;
+      const res = await apiPost('/api/operation/stop', {});
+      if (res.error) alert(`Error: ${res.error}`);
+    });
 
-  document.getElementById('setPcbsBtn')?.addEventListener('click', async () => {
-    const val = parseInt(document.getElementById('totalPcbsInput')?.value ?? '10');
-    if (val > 0) await apiPost('/api/operation/set-total', { totalPcbs: val });
-  });
+  document.getElementById('setPcbsBtn')
+    ?.addEventListener('click', async () => {
+      const val = parseInt(
+        document.getElementById('totalPcbsInput')?.value ?? '10'
+      );
+      if (val > 0) await apiPost('/api/operation/set-total', { totalPcbs: val });
+    });
 
-  // Configuration tab buttons
-  document.getElementById('readConfigBtn')?.addEventListener('click',  readConfiguration);
+  // Configuration tab
+  document.getElementById('readConfigBtn') ?.addEventListener('click', readConfiguration);
   document.getElementById('writeConfigBtn')?.addEventListener('click', writeConfiguration);
-  document.getElementById('softResetBtn')?.addEventListener('click',   softResetAll);
+  document.getElementById('softResetBtn')  ?.addEventListener('click', softResetAll);
 
   // Build RFID table rows
   const rfidBody = document.getElementById('rfidTableBody');
@@ -412,16 +484,18 @@ document.addEventListener('DOMContentLoaded', () => {
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>Box ${i + 1}</td>
-        <td><input type="text"   id="rfid-uid-high-${i}" placeholder="0x00000000" style="width:120px" /></td>
-        <td><input type="text"   id="rfid-uid-low-${i}"  placeholder="0x00000000" style="width:120px" /></td>
-        <td><input type="number" id="rfid-count-${i}" min="0" max="65535" value="0" style="width:80px" /></td>
-      `;
+        <td><input type="text" id="rfid-uid-high-${i}"
+             placeholder="0x00000000" style="width:120px" /></td>
+        <td><input type="text" id="rfid-uid-low-${i}"
+             placeholder="0x00000000" style="width:120px" /></td>
+        <td><input type="number" id="rfid-count-${i}"
+             min="0" max="65535" value="0" style="width:80px" /></td>`;
       rfidBody.appendChild(tr);
     }
   }
 });
 
-// ── Configuration helpers ─────────────────────────────────────────────────────
+// ── Configuration functions ───────────────────────────────────────────────────
 
 async function readConfiguration() {
   if (!AppState.connected) { alert('No stations connected'); return; }
@@ -452,7 +526,7 @@ async function readConfiguration() {
       });
     }
     if (cfg.volume != null) setRng('audio-volume', cfg.volume, 'audio-vol-val');
-    alert('Configuration read from stations');
+    alert('Configuration read successfully');
   } catch (err) {
     alert(`Read failed: ${err.message}`);
   }
@@ -462,9 +536,12 @@ async function writeConfiguration() {
   if (!AppState.connected) { alert('No stations connected'); return; }
   if (!confirm('Write configuration to all stations?')) return;
   const rfid = Array.from({ length: 4 }, (_, i) => ({
-    uidHigh: parseInt(document.getElementById(`rfid-uid-high-${i}`)?.value ?? '0', 16) || 0,
-    uidLow:  parseInt(document.getElementById(`rfid-uid-low-${i}`)?.value  ?? '0', 16) || 0,
-    count:   parseInt(document.getElementById(`rfid-count-${i}`)?.value    ?? '0') || 0,
+    uidHigh: parseInt(
+      document.getElementById(`rfid-uid-high-${i}`)?.value ?? '0', 16) || 0,
+    uidLow: parseInt(
+      document.getElementById(`rfid-uid-low-${i}`)?.value  ?? '0', 16) || 0,
+    count: parseInt(
+      document.getElementById(`rfid-count-${i}`)?.value    ?? '0') || 0,
   }));
   const body = {
     timing: {
@@ -492,7 +569,9 @@ async function writeConfiguration() {
 
 async function softResetAll() {
   if (!AppState.connected) { alert('No stations connected'); return; }
-  if (!confirm('Soft reset ALL stations?\nAny PCBs being processed may be lost.')) return;
+  if (!confirm(
+    'Soft reset ALL stations?\nAny PCBs being processed may be lost.\nContinue?'
+  )) return;
   try {
     const res = await apiPost('/api/configuration/soft-reset', {});
     if (res.error) throw new Error(res.error);
