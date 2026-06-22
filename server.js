@@ -9,6 +9,13 @@
  *   Case 1 — USB-RS485 adapter NOT connected
  *   Case 2 — USB-RS485 adapter connected, Station 4 NOT connected / no answer
  *   Case 3 — USB-RS485 adapter connected, Station 4 connected and responding
+ *
+ * Changes vs previous version:
+ *   - PORT_RESCAN_DELAY_MS reduced from 10 000 ms → 2 000 ms
+ *   - runInitSequence() no longer performs Phase 1 (soft reset),
+ *     Phase 2 (wait for reset complete), or Phase 3 (wait for UI load).
+ *     It goes straight from station detection to ID verification,
+ *     setup-page activation, and default-count writing.
  */
 
 'use strict';
@@ -59,16 +66,12 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PROBE_SLAVE_ID       = 4;
 const PROBE_TIMEOUT_MS     = 800;
-const PORT_RESCAN_DELAY_MS = 10000;
+const PORT_RESCAN_DELAY_MS = 2000;   // ← changed from 10 000 ms to 2 000 ms
 
 // ─── TIMING CONSTANTS ─────────────────────────────────────────────────────────
 
 const LOADER_WATCH_INTERVAL_MS = 2000;
 const LOADER_PING_RETRIES      = 2;
-const RESET_POLL_INTERVAL_MS   = 500;
-const RESET_TOTAL_TIMEOUT_MS   = 30000;
-const UI_WAIT_PER_STATION_MS   = 20000;
-const UI_POLL_INTERVAL_MS      = 500;
 
 // ─── APPLICATION STATE ────────────────────────────────────────────────────────
 
@@ -89,9 +92,9 @@ let systemStatus  = 'idle';
 let statusMessage = 'Starting up…';
 let initLogBuffer = [];
 
-// ── NEW: track whether at least one web client is connected ──────────────────
-let clientCount           = 0;       // number of active Socket.IO connections
-let initPendingForClient  = false;   // loader is present but no client yet
+// Track whether at least one web client is connected
+let clientCount          = 0;
+let initPendingForClient = false;   // loader present but no client yet
 
 const PARITY_MAP = { N: 'none', E: 'even', O: 'odd' };
 
@@ -428,15 +431,14 @@ function stopLoaderWatch() {
 
 // ─── LOADER DETECTED ─────────────────────────────────────────────────────────
 //
-// CHANGED: Only start initialization if at least one web client is connected.
-// If no client is connected yet, set a pending flag and update the status so
+// Only start initialization if at least one web client is connected.
+// If no client is connected yet, set a pending flag and update status so
 // the stations remain on ACTIVE_PAGE_ID = 0 (Startup page) until the GUI
-// connects and triggers the initialization.
+// connects and triggers initialization.
 
 async function onLoaderDetected() {
   if (initInProgress) return;
 
-  // ── Guard: require at least one connected web client ─────────────────────
   if (clientCount === 0) {
     initPendingForClient = true;
     console.log(
@@ -450,12 +452,12 @@ async function onLoaderDetected() {
     return;
   }
 
-  // Client(s) connected — proceed with initialization immediately
+  // Client(s) connected — proceed immediately
   initPendingForClient = false;
   await _startInitSequence();
 }
 
-// ─── INTERNAL: actually kick off init (shared by onLoaderDetected + client connect) ──
+// ─── INTERNAL: kick off init (shared by onLoaderDetected + client connect) ───
 
 async function _startInitSequence() {
   if (initInProgress) return;
@@ -523,9 +525,15 @@ async function onLoaderRemoved() {
 }
 
 // ─── INITIALIZATION SEQUENCE ──────────────────────────────────────────────────
+//
+// Phase 1 (soft reset), Phase 2 (wait for reset), and Phase 3 (wait for UI
+// load) have been removed.  The sequence now goes directly from station
+// detection to ID verification, setup-page activation, and default-count
+// writing — no resets, no waiting for UI.
 
 async function runInitSequence() {
 
+  // ── Step 1: Confirm PCB Loader ──────────────────────────────────────────
   log(`Detecting PCB Loader (Slave ID ${PCB_LOADER_SLAVE_ID})…`, 5);
   let loaderFound = false;
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -541,7 +549,8 @@ async function runInitSequence() {
   }
   log(`✓ PCB Loader confirmed (ID ${PCB_LOADER_SLAVE_ID})`, 10);
 
-  log('Detecting Pick and Place stations…', 12);
+  // ── Step 2: Detect P&P stations ─────────────────────────────────────────
+  log('Detecting Pick and Place stations…', 20);
   const foundPnp = [];
   for (const sid of SLAVE_IDS) {
     const found = await modbusHandler.pingStation(sid);
@@ -556,81 +565,23 @@ async function runInitSequence() {
   if (foundPnp.length === 0) {
     throw new Error('No Pick and Place stations detected');
   }
-  log(`✓ ${foundPnp.length} P&P station(s) found: [${foundPnp}]`, 18);
+  log(`✓ ${foundPnp.length} P&P station(s) found: [${foundPnp}]`, 35);
 
   const allStations = [PCB_LOADER_SLAVE_ID, ...foundPnp];
 
-  // Phase 1: Soft reset
-  log('\nPhase 1 — Sending soft reset to all stations…', 20);
-  for (const sid of allStations) {
-    const name = sid === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `Pick & Place ${sid}`;
-    const ok   = await modbusHandler.softReset(sid);
-    if (!ok) throw new Error(`Failed to send soft reset to ${name}`);
-    log(`  ↺ Reset sent → ${name}`);
-    await sleep(50);
-  }
+  // ── Step 3: Verify IDs, set setup page, write default counts ────────────
+  //
+  // (Previously "Phase 4" — now the only hardware-write step.)
+  // No soft reset or UI-load wait is performed.  The stations are assumed to
+  // already be running their UI (they were not reset).
 
-  // Phase 2: Wait for reset complete
-  log('\nPhase 2 — Waiting for all stations to complete reset…');
-  const pending    = new Set(allStations);
-  const confirmed  = new Set();
-  const resetStart = Date.now();
-
-  while (pending.size > 0) {
-    if (Date.now() - resetStart > RESET_TOTAL_TIMEOUT_MS) {
-      const names = [...pending].map((s) =>
-        s === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `Pick & Place ${s}`
-      );
-      throw new Error(
-        `Reset timeout (${RESET_TOTAL_TIMEOUT_MS / 1000}s) for: ${names.join(', ')}`
-      );
-    }
-    for (const sid of [...pending]) {
-      const done = await modbusHandler.checkSoftResetComplete(sid);
-      if (done) {
-        const name = sid === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `Pick & Place ${sid}`;
-        log(`  ✓ ${name}: reset complete`);
-        pending.delete(sid);
-        confirmed.add(sid);
-        broadcast('initProgress', {
-          pct: 20 + Math.round((confirmed.size / allStations.length) * 30),
-        });
-      }
-    }
-    if (pending.size > 0) await sleep(RESET_POLL_INTERVAL_MS);
-  }
-
-  // Phase 3: Wait for UI load
-  log('\nPhase 3 — Waiting for UIs to load on all stations…');
-  broadcast('initProgress', { pct: 55 });
-
-  for (let i = 0; i < allStations.length; i++) {
-    const sid  = allStations[i];
-    const name = sid === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `Pick & Place ${sid}`;
-    log(`  ⏳ Waiting for ${name} UI…`);
-
-    const uiLoaded = await modbusHandler.checkUiLoaded(
-      sid, UI_WAIT_PER_STATION_MS, UI_POLL_INTERVAL_MS
-    );
-    if (!uiLoaded) {
-      throw new Error(
-        `${name} UI did not load within ${UI_WAIT_PER_STATION_MS / 1000}s`
-      );
-    }
-    log(`  ✓ ${name}: UI loaded`);
-    broadcast('initProgress', {
-      pct: 55 + Math.round(((i + 1) / allStations.length) * 20),
-    });
-  }
-
-  // Phase 4: Verify IDs, set setup page, write default counts
-  log('\nPhase 4 — Verifying IDs, setting setup page and default components…');
-  broadcast('initProgress', { pct: 78 });
+  log('\nVerifying IDs, setting setup page and default components…', 40);
 
   for (let i = 0; i < allStations.length; i++) {
     const sid  = allStations[i];
     const name = sid === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `Pick & Place ${sid}`;
 
+    // Verify station ID register
     const stationId = await modbusHandler.getStationId(sid);
     if (stationId === null) {
       throw new Error(`${name}: could not read station ID register`);
@@ -639,11 +590,13 @@ async function runInitSequence() {
       throw new Error(`${name} ID mismatch: expected ${sid}, got ${stationId}`);
     }
 
+    // Set active page to Setup
     const pageOk = await modbusHandler.setActivePage(
       sid, PageID.PLACEMENT_PARAMETERS_SETUP
     );
     if (!pageOk) throw new Error(`Failed to set setup page for ${name}`);
 
+    // Write default component counts
     const countsOk = await modbusHandler.setTotalPositions(
       sid,
       DefaultComponentCounts.transistors,
@@ -662,11 +615,13 @@ async function runInitSequence() {
       `IC:${DefaultComponentCounts.ics} ` +
       `C:${DefaultComponentCounts.capacitors})`
     );
+
     broadcast('initProgress', {
-      pct: 78 + Math.round(((i + 1) / allStations.length) * 20),
+      pct: 40 + Math.round(((i + 1) / allStations.length) * 58),
     });
   }
 
+  // ── Done ─────────────────────────────────────────────────────────────────
   log('', 100);
   log('✓ ALL STATIONS INITIALIZED SUCCESSFULLY');
   log(`  PCB Loader  : Slave ID ${PCB_LOADER_SLAVE_ID}`);
@@ -698,7 +653,6 @@ async function runInitSequence() {
 io.on('connection', (socket) => {
   console.log('[Socket] Client connected:', socket.id);
 
-  // ── Track client count ────────────────────────────────────────────────────
   clientCount++;
   console.log(`[Socket] Active clients: ${clientCount}`);
 
@@ -717,13 +671,12 @@ io.on('connection', (socket) => {
     socket.emit('snapshot', stationManager.getSnapshot());
   }
 
-  // ── CHANGED: if loader is present but init was held, start it now ─────────
+  // If loader is present but init was held for a client, start it now
   if (initPendingForClient && clientCount === 1) {
     console.log(
       '[Socket] First web client connected and init was pending — ' +
       'starting initialization now'
     );
-    // Fire async, do not await (socket handler must return synchronously)
     setImmediate(async () => {
       initPendingForClient = false;
       // Inform the new client that the loader is present before init starts
