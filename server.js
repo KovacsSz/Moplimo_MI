@@ -14,9 +14,6 @@
 'use strict';
 
 // ─── GLOBAL UNHANDLED-ERROR SAFETY NET ───────────────────────────────────────
-// modbus-serial / serialport can emit 'error' events on the underlying
-// EventEmitter after we have already called close(). This guard prevents
-// Node from crashing on those late-arriving errors.
 process.on('uncaughtException', (err) => {
   console.warn('[Process] Caught unhandled exception (suppressed):', err.message);
 });
@@ -60,9 +57,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── PORT DETECTION CONFIGURATION ────────────────────────────────────────────
 
-const PROBE_SLAVE_ID       = 4;      // Station always present — used for port ID
-const PROBE_TIMEOUT_MS     = 800;    // Per-port probe timeout
-const PORT_RESCAN_DELAY_MS = 10000;  // Retry delay when no port found
+const PROBE_SLAVE_ID       = 4;
+const PROBE_TIMEOUT_MS     = 800;
+const PORT_RESCAN_DELAY_MS = 10000;
 
 // ─── TIMING CONSTANTS ─────────────────────────────────────────────────────────
 
@@ -91,6 +88,10 @@ let initInProgress    = false;
 let systemStatus  = 'idle';
 let statusMessage = 'Starting up…';
 let initLogBuffer = [];
+
+// ── NEW: track whether at least one web client is connected ──────────────────
+let clientCount           = 0;       // number of active Socket.IO connections
+let initPendingForClient  = false;   // loader is present but no client yet
 
 const PARITY_MAP = { N: 'none', E: 'even', O: 'odd' };
 
@@ -189,12 +190,6 @@ function managerEmit(event) {
 
 // ─── SERIAL PORT AUTO-DETECTION ───────────────────────────────────────────────
 
-/**
- * getCandidatePorts()
- *
- * Windows : all COMx ports returned by SerialPort.list()
- * Linux   : ttyUSB*, ttyACM*, ttyAMA*, ttyS0-ttyS3
- */
 async function getCandidatePorts() {
   let all = [];
   try {
@@ -214,7 +209,6 @@ async function getCandidatePorts() {
     return false;
   });
 
-  // USB adapters first (most likely), then ACM, AMA, ttyS
   candidates.sort((a, b) => {
     const rank = (pt) => {
       if (pt.includes('ttyUSB')) return 0;
@@ -228,58 +222,30 @@ async function getCandidatePorts() {
   return candidates;
 }
 
-/**
- * silentClose(client)
- *
- * Closes a ModbusRTU client and its underlying port without allowing
- * any 'error' events to propagate.
- */
 function silentClose(client) {
   if (!client) return;
   try {
-    // Remove all listeners from the underlying port before closing
     const port = client._port;
     if (port) {
       try { port.removeAllListeners(); } catch { /* ignore */ }
     }
-    // Also silence the client itself
     try { client.removeAllListeners(); } catch { /* ignore */ }
-    // Now close
     if (client.isOpen) {
       client.close(() => {});
     }
-  } catch { /* ignore every possible error */ }
+  } catch { /* ignore */ }
 }
 
-/**
- * probePort(portPath)
- *
- * Opens portPath with project Modbus settings, reads Discrete Input 0
- * (IS_UI_LOADED) from Slave ID 4.
- *
- * Returns true  → Station 4 responded   (Case 3)
- * Returns false → port opened but no response (Case 2)
- *              OR port could not be opened     (Case 1)
- *
- * NEVER throws, NEVER leaves an unhandled error event.
- */
 async function probePort(portPath) {
   console.log(`[Probe] Testing ${portPath} …`);
 
-  // We build the Modbus client directly here (not via ModbusHandler)
-  // so we have full control over the lifecycle and error listeners.
   const client = new ModbusRTU();
-
-  // Arm a catch-all error listener BEFORE anything else.
-  // This prevents Node from crashing if the port emits 'error'
-  // after we call close() (Windows serial driver timing issue).
-  const noop = () => {};
+  const noop   = () => {};
   client.on('error', noop);
 
   let opened = false;
 
   try {
-    // ── Try to open the port ──────────────────────────────────────────────
     await client.connectRTUBuffered(portPath, {
       baudRate: MODBUS_BAUDRATE,
       parity:   PARITY_MAP[MODBUS_PARITY] ?? 'none',
@@ -288,17 +254,13 @@ async function probePort(portPath) {
     });
     opened = true;
 
-    // Also attach the noop to the underlying serialport's error event
     try {
       if (client._port) client._port.on('error', noop);
     } catch { /* ignore */ }
 
     client.setTimeout(PROBE_TIMEOUT_MS);
-
-    // Small settling delay after open
     await sleep(150);
 
-    // ── Try to read Discrete Input 0 from Slave ID 4 ──────────────────────
     client.setID(PROBE_SLAVE_ID);
 
     let responded = false;
@@ -308,37 +270,28 @@ async function probePort(portPath) {
       );
       responded = result !== null && result.data !== undefined;
     } catch {
-      // Timeout or Modbus error — station not present on this port
       responded = false;
     }
 
     console.log(
       responded
         ? `[Probe] ${portPath}: ✓ Slave ${PROBE_SLAVE_ID} responded`
-        : `[Probe] ${portPath}: no response from Slave ${PROBE_SLAVE_ID} (station absent?)`
+        : `[Probe] ${portPath}: no response from Slave ${PROBE_SLAVE_ID}`
     );
 
     return responded;
 
   } catch (err) {
-    // connect() failed — adapter not present or access denied
     console.log(`[Probe] ${portPath}: could not open — ${err.message}`);
     return false;
 
   } finally {
-    // Always close cleanly, suppressing every possible error
-    await sleep(50);  // let any pending I/O settle first
+    await sleep(50);
     silentClose(client);
-    await sleep(250); // let OS release the port
+    await sleep(250);
   }
 }
 
-/**
- * autoDetectPort()
- *
- * Probes each candidate port in order and returns the first one
- * where Station 4 responds. Returns null if none respond.
- */
 async function autoDetectPort() {
   const candidates = await getCandidatePorts();
 
@@ -364,15 +317,6 @@ async function autoDetectPort() {
   return null;
 }
 
-/**
- * autoConnect()
- *
- * 1. Auto-detect the correct port
- * 2. Open a permanent ModbusHandler on that port
- * 3. Start the PCB Loader watch loop
- *
- * Retries every PORT_RESCAN_DELAY_MS if detection fails.
- */
 async function autoConnect() {
   setStatus('connecting', 'Scanning serial ports for Modbus bus…');
   console.log('[Server] Starting serial port auto-detection…');
@@ -392,7 +336,6 @@ async function autoConnect() {
   detectedPort = portPath;
   setStatus('connecting', `Port ${portPath} identified — connecting…`);
 
-  // Clean up any previous handler
   if (modbusHandler) {
     try { modbusHandler.disconnect(); } catch { /* ignore */ }
     modbusHandler = null;
@@ -484,9 +427,40 @@ function stopLoaderWatch() {
 }
 
 // ─── LOADER DETECTED ─────────────────────────────────────────────────────────
+//
+// CHANGED: Only start initialization if at least one web client is connected.
+// If no client is connected yet, set a pending flag and update the status so
+// the stations remain on ACTIVE_PAGE_ID = 0 (Startup page) until the GUI
+// connects and triggers the initialization.
 
 async function onLoaderDetected() {
   if (initInProgress) return;
+
+  // ── Guard: require at least one connected web client ─────────────────────
+  if (clientCount === 0) {
+    initPendingForClient = true;
+    console.log(
+      '[Server] PCB Loader detected but no web client connected — ' +
+      'holding in Startup page until client connects'
+    );
+    setStatus(
+      'idle',
+      'PCB Loader present — waiting for web client before initializing…'
+    );
+    return;
+  }
+
+  // Client(s) connected — proceed with initialization immediately
+  initPendingForClient = false;
+  await _startInitSequence();
+}
+
+// ─── INTERNAL: actually kick off init (shared by onLoaderDetected + client connect) ──
+
+async function _startInitSequence() {
+  if (initInProgress) return;
+  if (!loaderPresent)  return;   // loader may have disappeared while we waited
+
   initInProgress = true;
   initLogBuffer  = [];
 
@@ -517,6 +491,9 @@ async function onLoaderDetected() {
 
 async function onLoaderRemoved() {
   console.log('[Server] PCB Loader removed — resetting all stations to idle');
+
+  // Clear the pending flag — loader is gone, nothing to initialize
+  initPendingForClient = false;
 
   if (stationManager) {
     stationManager._stopPolling();
@@ -721,6 +698,11 @@ async function runInitSequence() {
 io.on('connection', (socket) => {
   console.log('[Socket] Client connected:', socket.id);
 
+  // ── Track client count ────────────────────────────────────────────────────
+  clientCount++;
+  console.log(`[Socket] Active clients: ${clientCount}`);
+
+  // Send current state to the newly connected client
   socket.emit('systemState', buildSystemState());
   socket.emit('connectionState', {
     connected:         modbusHandler?.connected ?? false,
@@ -735,8 +717,27 @@ io.on('connection', (socket) => {
     socket.emit('snapshot', stationManager.getSnapshot());
   }
 
+  // ── CHANGED: if loader is present but init was held, start it now ─────────
+  if (initPendingForClient && clientCount === 1) {
+    console.log(
+      '[Socket] First web client connected and init was pending — ' +
+      'starting initialization now'
+    );
+    // Fire async, do not await (socket handler must return synchronously)
+    setImmediate(async () => {
+      initPendingForClient = false;
+      // Inform the new client that the loader is present before init starts
+      socket.emit('loaderDetected', { slaveId: PCB_LOADER_SLAVE_ID });
+      await _startInitSequence();
+    });
+  }
+
   socket.on('disconnect', () => {
-    console.log('[Socket] Client disconnected:', socket.id);
+    clientCount = Math.max(0, clientCount - 1);
+    console.log(
+      `[Socket] Client disconnected: ${socket.id} — ` +
+      `Active clients: ${clientCount}`
+    );
   });
 });
 
