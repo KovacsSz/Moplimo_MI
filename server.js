@@ -2,20 +2,22 @@
  * SMT Pick and Place Machine Controller
  * Express + Socket.IO backend server
  *
- * Auto-detects the correct serial port by pinging Slave ID 4
- * (Discrete Input 0 / IS_UI_LOADED), then monitors for PCB Loader (Slave ID 5).
- *
- * Handles all 3 real-world cases without crashing:
- *   Case 1 — USB-RS485 adapter NOT connected
- *   Case 2 — USB-RS485 adapter connected, Station 4 NOT connected / no answer
- *   Case 3 — USB-RS485 adapter connected, Station 4 connected and responding
- *
- * Changes vs previous version:
- *   - PORT_RESCAN_DELAY_MS reduced from 10 000 ms → 2 000 ms
- *   - runInitSequence() no longer performs Phase 1 (soft reset),
- *     Phase 2 (wait for reset complete), or Phase 3 (wait for UI load).
- *     It goes straight from station detection to ID verification,
- *     setup-page activation, and default-count writing.
+ * Behaviour summary:
+ *  - Auto-detects COM port by pinging Slave ID 4.
+ *  - Watches for PCB Loader (Slave ID 5).
+ *  - Initialization runs only when BOTH ID5 is present AND ≥1 web client connected.
+ *  - If ID5 disappears OR last web client disconnects while stations are on
+ *    ACTIVE_PAGE_ID 1 (setup) or 2 (animation):
+ *      → write ACTIVE_PAGE_ID = 0 (Startup) to every station
+ *      → set "Waiting for initialization" status
+ *      → all station activity frozen.
+ *  - When a web client connects again while frozen:
+ *      → if ID5 is present: re-run init (sets ACTIVE_PAGE_ID = 1 on all stations)
+ *      → if ID5 absent: set pending flag, wait for ID5
+ *  - If BOTH ID5 and ID4 are offline:
+ *      → stop all comms, ping ID4 on the existing open port (no re-scan).
+ *  - PORT_RESCAN_DELAY_MS = 2 000 ms.
+ *  - No soft-reset / UI-load phases during init.
  */
 
 'use strict';
@@ -62,16 +64,27 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ─── PORT DETECTION CONFIGURATION ────────────────────────────────────────────
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
-const PROBE_SLAVE_ID       = 4;
-const PROBE_TIMEOUT_MS     = 800;
-const PORT_RESCAN_DELAY_MS = 2000;   // ← changed from 10 000 ms to 2 000 ms
-
-// ─── TIMING CONSTANTS ─────────────────────────────────────────────────────────
-
-const LOADER_WATCH_INTERVAL_MS = 2000;
+const PROBE_SLAVE_ID           = 4;
+const PROBE_TIMEOUT_MS         = 200;
+const PORT_RESCAN_DELAY_MS     = 500;
+const LOADER_WATCH_INTERVAL_MS = 500;
 const LOADER_PING_RETRIES      = 2;
+const ID4_PING_INTERVAL_MS     = 500;
+const ID4_PING_TIMEOUT_MS      = 200;
+
+// Pages that mean "actively in use" — leaving these requires writing STARTUP(0)
+const ACTIVE_PAGES = new Set([
+  PageID.PLACEMENT_PARAMETERS_SETUP,   // 1
+  PageID.PICK_AND_PLACE_ANIMATION,     // 2
+]);
+
+const PARITY_MAP = { N: 'none', E: 'even', O: 'odd' };
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 // ─── APPLICATION STATE ────────────────────────────────────────────────────────
 
@@ -83,26 +96,39 @@ let pnpStations       = [];
 let pendingTotalPcbs  = 10;
 let detectedPort      = null;
 
+// Tracks the last ACTIVE_PAGE_ID written to all stations.
+//   null  = unknown / never set (pre first init)
+//   0     = STARTUP  (frozen / waiting for init)
+//   1     = PLACEMENT_PARAMETERS_SETUP
+//   2     = PICK_AND_PLACE_ANIMATION
+let currentStationPage = null;
+
+// Flag: system was frozen (page 0) and is waiting for a client + ID5
+// so it can re-initialize automatically.
+let frozenWaitingForClient = false;
+
+// Loader watch
 let loaderWatchActive = false;
 let loaderWatchTimer  = null;
 let loaderPresent     = false;
-let initInProgress    = false;
 
+// Initialisation gate
+let initInProgress       = false;
+let initPendingForClient = false;  // loader present but no client yet
+
+// Web-client tracking
+let clientCount = 0;
+
+// ID4 recovery ping loop
+let id4PingActive = false;
+let id4PingTimer  = null;
+
+// System status
 let systemStatus  = 'idle';
 let statusMessage = 'Starting up…';
 let initLogBuffer = [];
 
-// Track whether at least one web client is connected
-let clientCount          = 0;
-let initPendingForClient = false;   // loader present but no client yet
-
-const PARITY_MAP = { N: 'none', E: 'even', O: 'odd' };
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// ─── LOGGING / BROADCAST ──────────────────────────────────────────────────────
+// ─── BROADCAST HELPERS ────────────────────────────────────────────────────────
 
 function broadcast(event, data) {
   io.emit(event, data);
@@ -141,7 +167,7 @@ function buildSystemState() {
   };
 }
 
-// ─── MANAGER EMIT ─────────────────────────────────────────────────────────────
+// ─── STATION-MANAGER EMIT ─────────────────────────────────────────────────────
 
 function managerEmit(event) {
   io.emit(event.type, event);
@@ -152,9 +178,7 @@ function managerEmit(event) {
       setTimeout(async () => {
         try {
           setStatus('production', 'Starting production…');
-          for (const sid of availableStations) {
-            await modbusHandler.setActivePage(sid, PageID.PICK_AND_PLACE_ANIMATION);
-          }
+          await _setAllStationsPage(PageID.PICK_AND_PLACE_ANIMATION);
           await stationManager.startProduction(pendingTotalPcbs);
         } catch (err) {
           console.error('[Server] Failed to auto-start production:', err.message);
@@ -176,6 +200,7 @@ function managerEmit(event) {
       break;
 
     case 'returnedToSetup':
+      currentStationPage = PageID.PLACEMENT_PARAMETERS_SETUP;
       setStatus('ready', 'Setup mode — ready for next batch');
       broadcast('connectionState', {
         connected: true,
@@ -189,6 +214,28 @@ function managerEmit(event) {
       broadcast('setupComplete', {});
       break;
   }
+}
+
+// ─── HELPER: set ACTIVE_PAGE_ID on all known stations ────────────────────────
+
+async function _setAllStationsPage(pageId) {
+  if (!modbusHandler || !modbusHandler.connected) return;
+
+  const stations = availableStations.length > 0
+    ? availableStations
+    : (loaderPresent ? [PCB_LOADER_SLAVE_ID] : []);
+
+  for (const sid of stations) {
+    try {
+      const ok = await modbusHandler.setActivePage(sid, pageId);
+      console.log(
+        `[Server] setActivePage(${sid}, ${pageId}) → ${ok ? 'OK' : 'FAILED'}`
+      );
+    } catch (err) {
+      console.warn(`[Server] setActivePage(${sid}) error: ${err.message}`);
+    }
+  }
+  currentStationPage = pageId;
 }
 
 // ─── SERIAL PORT AUTO-DETECTION ───────────────────────────────────────────────
@@ -229,13 +276,9 @@ function silentClose(client) {
   if (!client) return;
   try {
     const port = client._port;
-    if (port) {
-      try { port.removeAllListeners(); } catch { /* ignore */ }
-    }
+    if (port) { try { port.removeAllListeners(); } catch { /* ignore */ } }
     try { client.removeAllListeners(); } catch { /* ignore */ }
-    if (client.isOpen) {
-      client.close(() => {});
-    }
+    if (client.isOpen) client.close(() => {});
   } catch { /* ignore */ }
 }
 
@@ -246,8 +289,6 @@ async function probePort(portPath) {
   const noop   = () => {};
   client.on('error', noop);
 
-  let opened = false;
-
   try {
     await client.connectRTUBuffered(portPath, {
       baudRate: MODBUS_BAUDRATE,
@@ -255,15 +296,11 @@ async function probePort(portPath) {
       stopBits: MODBUS_STOP_BITS,
       dataBits: MODBUS_DATA_BITS,
     });
-    opened = true;
 
-    try {
-      if (client._port) client._port.on('error', noop);
-    } catch { /* ignore */ }
+    try { if (client._port) client._port.on('error', noop); } catch { /* ignore */ }
 
     client.setTimeout(PROBE_TIMEOUT_MS);
     await sleep(150);
-
     client.setID(PROBE_SLAVE_ID);
 
     let responded = false;
@@ -272,16 +309,13 @@ async function probePort(portPath) {
         DiscreteInputAddresses.IS_UI_LOADED, 1
       );
       responded = result !== null && result.data !== undefined;
-    } catch {
-      responded = false;
-    }
+    } catch { responded = false; }
 
     console.log(
       responded
         ? `[Probe] ${portPath}: ✓ Slave ${PROBE_SLAVE_ID} responded`
         : `[Probe] ${portPath}: no response from Slave ${PROBE_SLAVE_ID}`
     );
-
     return responded;
 
   } catch (err) {
@@ -309,8 +343,7 @@ async function autoDetectPort() {
   );
 
   for (const candidate of candidates) {
-    const found = await probePort(candidate.path);
-    if (found) {
+    if (await probePort(candidate.path)) {
       console.log(`[Probe] ✓ Modbus bus detected on ${candidate.path}`);
       return candidate.path;
     }
@@ -320,6 +353,8 @@ async function autoDetectPort() {
   return null;
 }
 
+// ─── INITIAL SERVER START ─────────────────────────────────────────────────────
+
 async function autoConnect() {
   setStatus('connecting', 'Scanning serial ports for Modbus bus…');
   console.log('[Server] Starting serial port auto-detection…');
@@ -327,15 +362,17 @@ async function autoConnect() {
   const portPath = await autoDetectPort();
 
   if (!portPath) {
-    const msg =
-      `No Modbus bus found. ` +
-      `Retrying in ${PORT_RESCAN_DELAY_MS / 1000} s…`;
+    const msg = `No Modbus bus found. Retrying in ${PORT_RESCAN_DELAY_MS / 1000} s…`;
     setStatus('error', msg);
     console.error(`[Server] ${msg}`);
     setTimeout(autoConnect, PORT_RESCAN_DELAY_MS);
     return;
   }
 
+  await _openPort(portPath);
+}
+
+async function _openPort(portPath) {
   detectedPort = portPath;
   setStatus('connecting', `Port ${portPath} identified — connecting…`);
 
@@ -353,8 +390,7 @@ async function autoConnect() {
   const connected = await modbusHandler.connect();
   if (!connected) {
     const msg =
-      `Failed to open ${portPath}. ` +
-      `Retrying in ${PORT_RESCAN_DELAY_MS / 1000} s…`;
+      `Failed to open ${portPath}. Retrying in ${PORT_RESCAN_DELAY_MS / 1000} s…`;
     setStatus('error', msg);
     console.error(`[Server] ${msg}`);
     detectedPort  = null;
@@ -393,13 +429,13 @@ async function loaderWatchLoop() {
 
     if (nowPresent && !loaderPresent) {
       loaderPresent = true;
-      console.log('[Watch] PCB Loader appeared');
+      console.log('[Watch] PCB Loader (ID5) appeared');
       broadcast('loaderDetected', { slaveId: PCB_LOADER_SLAVE_ID });
       await onLoaderDetected();
 
     } else if (!nowPresent && loaderPresent) {
       loaderPresent = false;
-      console.log('[Watch] PCB Loader disappeared');
+      console.log('[Watch] PCB Loader (ID5) disappeared');
       broadcast('loaderRemoved', { slaveId: PCB_LOADER_SLAVE_ID });
       await onLoaderRemoved();
     }
@@ -429,12 +465,216 @@ function stopLoaderWatch() {
   console.log('[Watch] PCB Loader watch stopped');
 }
 
-// ─── LOADER DETECTED ─────────────────────────────────────────────────────────
+// ─── ID4 RECOVERY PING LOOP ──────────────────────────────────────────────────
+
+async function pingId4Once() {
+  if (!modbusHandler || !modbusHandler.connected) return false;
+  try {
+    const orig = modbusHandler.timeoutMs;
+    modbusHandler.timeoutMs = ID4_PING_TIMEOUT_MS;
+    modbusHandler.client.setTimeout(ID4_PING_TIMEOUT_MS);
+    const ok = await modbusHandler.pingStation(PROBE_SLAVE_ID);
+    modbusHandler.timeoutMs = orig;
+    modbusHandler.client.setTimeout(orig);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function startId4PingLoop() {
+  if (id4PingActive) return;
+  id4PingActive = true;
+  console.log('[Recovery] Starting ID4 ping loop on existing port…');
+  _id4PingTick();
+}
+
+function stopId4PingLoop() {
+  id4PingActive = false;
+  if (id4PingTimer) {
+    clearTimeout(id4PingTimer);
+    id4PingTimer = null;
+  }
+  console.log('[Recovery] ID4 ping loop stopped');
+}
+
+async function _id4PingTick() {
+  if (!id4PingActive) return;
+
+  try {
+    const ok = await pingId4Once();
+    if (ok) {
+      console.log('[Recovery] ID4 responded — resuming loader watch');
+      stopId4PingLoop();
+      startLoaderWatch();
+      setStatus(
+        'idle',
+        `Bus restored — watching for PCB Loader (Slave ID ${PCB_LOADER_SLAVE_ID})…`
+      );
+      return;
+    }
+    console.log('[Recovery] ID4 still offline…');
+  } catch (err) {
+    console.error('[Recovery] Ping error:', err.message);
+  }
+
+  if (id4PingActive) {
+    id4PingTimer = setTimeout(_id4PingTick, ID4_PING_INTERVAL_MS);
+  }
+}
+
+// ─── FULL STATION TEARDOWN (port stays open) ──────────────────────────────────
+
+function _teardownStations() {
+  if (stationManager) {
+    stationManager._stopPolling();
+    stationManager = null;
+  }
+
+  stopLoaderWatch();
+
+  availableStations      = [];
+  pnpStations            = [];
+  loaderPresent          = false;
+  initInProgress         = false;
+  initPendingForClient   = false;
+  frozenWaitingForClient = false;
+  currentStationPage     = null;
+
+  broadcast('connectionState', {
+    connected:         false,
+    availableStations: [],
+    loaderStationId,
+    pnpStations:       [],
+  });
+}
+
+// ─── CHECK ID4 → MAYBE ESCALATE TO FULL RECOVERY ─────────────────────────────
+
+async function _checkId4AndMaybeRecover() {
+  console.log('[Server] Checking whether ID4 is still online…');
+
+  const id4Ok = await pingId4Once();
+
+  if (id4Ok) {
+    console.log('[Server] ID4 still online — keeping port open, watching for ID5');
+    return;
+  }
+
+  console.log('[Server] ID4 also offline — entering full recovery mode');
+  setStatus(
+    'error',
+    'Bus offline (ID4 + ID5 not responding) — waiting for bus to recover…'
+  );
+
+  _teardownStations();
+  startId4PingLoop();
+}
+
+// ─── FREEZE FOR RE-INITIALIZATION ────────────────────────────────────────────
 //
-// Only start initialization if at least one web client is connected.
-// If no client is connected yet, set a pending flag and update status so
-// the stations remain on ACTIVE_PAGE_ID = 0 (Startup page) until the GUI
-// connects and triggers initialization.
+// 1. Stops the station manager poll.
+// 2. Writes ACTIVE_PAGE_ID = 0 (STARTUP) to every station currently on
+//    page 1 or 2.
+// 3. Sets frozenWaitingForClient = true so that the next client connection
+//    knows it must re-run initialization.
+// 4. Updates system status to "Waiting for initialization".
+
+async function _freezeForReinitialization(msg) {
+  console.log(`[Server] Freezing — ${msg}`);
+
+  // Stop manager first so no more Modbus traffic races with our writes
+  if (stationManager) {
+    stationManager._stopPolling();
+    stationManager = null;
+  }
+
+  // Write STARTUP page (0) to every station that is on an active page
+  if (
+    modbusHandler &&
+    modbusHandler.connected &&
+    ACTIVE_PAGES.has(currentStationPage)
+  ) {
+    const stations = availableStations.length > 0
+      ? availableStations
+      : (loaderPresent ? [PCB_LOADER_SLAVE_ID] : []);
+
+    console.log(
+      `[Server] Writing STARTUP page (0) to ${stations.length} station(s)…`
+    );
+
+    for (const sid of stations) {
+      try {
+        const ok = await modbusHandler.setActivePage(sid, PageID.STARTUP);
+        console.log(
+          `[Server]   Station ${sid}: setActivePage(STARTUP=0) → ${ok ? 'OK' : 'FAILED'}`
+        );
+      } catch (err) {
+        console.warn(
+          `[Server]   Station ${sid}: setActivePage error — ${err.message}`
+        );
+      }
+    }
+    currentStationPage = PageID.STARTUP;
+  }
+
+  // Clear tracking state but keep the COM port open
+  availableStations    = [];
+  pnpStations          = [];
+  initInProgress       = false;
+  initPendingForClient = false;
+
+  // Mark that we are frozen: next client connect + ID5 present → re-init
+  frozenWaitingForClient = true;
+
+  setStatus('idle', msg);
+
+  broadcast('connectionState', {
+    connected:         false,
+    availableStations: [],
+    loaderStationId,
+    pnpStations:       [],
+  });
+}
+
+// ─── ON CLIENT RECONNECT WHILE FROZEN ────────────────────────────────────────
+//
+// Called when a web client connects and frozenWaitingForClient is true.
+// Restores ACTIVE_PAGE_ID = 1 on all reachable stations, then re-runs the
+// full initialization sequence (which will also re-discover P&P stations).
+
+async function _onClientReconnectWhileFrozen(socket) {
+  console.log(
+    '[Server] Client reconnected while frozen — ' +
+    'setting ACTIVE_PAGE_ID=1 and re-initializing…'
+  );
+
+  frozenWaitingForClient = false;   // clear flag before async work
+
+  // Inform the GUI that the loader is present so the progress bar appears
+  socket.emit('loaderDetected', { slaveId: PCB_LOADER_SLAVE_ID });
+
+  // Write ACTIVE_PAGE_ID = 1 (setup) to whatever stations are still reachable.
+  // runInitSequence() will re-detect and write again anyway, but doing it here
+  // gives immediate visual feedback on the station displays.
+  if (modbusHandler && modbusHandler.connected && loaderPresent) {
+    console.log('[Server] Pre-setting ACTIVE_PAGE_ID=1 on loader before init…');
+    try {
+      await modbusHandler.setActivePage(
+        PCB_LOADER_SLAVE_ID,
+        PageID.PLACEMENT_PARAMETERS_SETUP
+      );
+      currentStationPage = PageID.PLACEMENT_PARAMETERS_SETUP;
+    } catch (err) {
+      console.warn('[Server] Pre-set page failed:', err.message);
+    }
+  }
+
+  // Run the full init sequence
+  await _startInitSequence();
+}
+
+// ─── LOADER DETECTED ─────────────────────────────────────────────────────────
 
 async function onLoaderDetected() {
   if (initInProgress) return;
@@ -452,16 +692,47 @@ async function onLoaderDetected() {
     return;
   }
 
-  // Client(s) connected — proceed immediately
   initPendingForClient = false;
   await _startInitSequence();
 }
 
-// ─── INTERNAL: kick off init (shared by onLoaderDetected + client connect) ───
+// ─── LOADER REMOVED ──────────────────────────────────────────────────────────
+
+async function onLoaderRemoved() {
+  console.log('[Server] PCB Loader (ID5) removed');
+  initPendingForClient = false;
+
+  await _freezeForReinitialization(
+    'PCB Loader disconnected — waiting for initialization…'
+  );
+
+  await _checkId4AndMaybeRecover();
+}
+
+// ─── LAST CLIENT DISCONNECTED ─────────────────────────────────────────────────
+
+async function onLastClientDisconnected() {
+  console.log('[Server] Last web client disconnected');
+
+  if (!ACTIVE_PAGES.has(currentStationPage)) {
+    console.log(
+      `[Server] Stations on page ${currentStationPage} — no page change needed`
+    );
+    return;
+  }
+
+  await _freezeForReinitialization(
+    'Web client disconnected — waiting for initialization…'
+  );
+
+  await _checkId4AndMaybeRecover();
+}
+
+// ─── KICK OFF INIT SEQUENCE ───────────────────────────────────────────────────
 
 async function _startInitSequence() {
   if (initInProgress) return;
-  if (!loaderPresent)  return;   // loader may have disappeared while we waited
+  if (!loaderPresent)  return;
 
   initInProgress = true;
   initLogBuffer  = [];
@@ -475,9 +746,10 @@ async function _startInitSequence() {
     log(`✗ INITIALIZATION FAILED: ${err.message}`);
     setStatus('error', `Initialization failed: ${err.message}`);
 
-    availableStations = [];
-    pnpStations       = [];
-    stationManager    = null;
+    availableStations  = [];
+    pnpStations        = [];
+    stationManager     = null;
+    currentStationPage = null;
     broadcast('connectionState', {
       connected:         false,
       availableStations: [],
@@ -489,51 +761,11 @@ async function _startInitSequence() {
   }
 }
 
-// ─── LOADER REMOVED ──────────────────────────────────────────────────────────
-
-async function onLoaderRemoved() {
-  console.log('[Server] PCB Loader removed — resetting all stations to idle');
-
-  // Clear the pending flag — loader is gone, nothing to initialize
-  initPendingForClient = false;
-
-  if (stationManager) {
-    stationManager._stopPolling();
-    stationManager = null;
-  }
-
-  if (modbusHandler && modbusHandler.connected && pnpStations.length > 0) {
-    for (const sid of pnpStations) {
-      try {
-        await modbusHandler.setActivePage(sid, PageID.PLACEMENT_PARAMETERS_SETUP);
-        console.log(`[Server] Station ${sid} returned to setup page`);
-      } catch { /* station may also be offline */ }
-    }
-  }
-
-  availableStations = [];
-  pnpStations       = [];
-
-  setStatus('idle', 'PCB Loader disconnected — waiting for reconnection…');
-
-  broadcast('connectionState', {
-    connected:         false,
-    availableStations: [],
-    loaderStationId,
-    pnpStations:       [],
-  });
-}
-
 // ─── INITIALIZATION SEQUENCE ──────────────────────────────────────────────────
-//
-// Phase 1 (soft reset), Phase 2 (wait for reset), and Phase 3 (wait for UI
-// load) have been removed.  The sequence now goes directly from station
-// detection to ID verification, setup-page activation, and default-count
-// writing — no resets, no waiting for UI.
 
 async function runInitSequence() {
 
-  // ── Step 1: Confirm PCB Loader ──────────────────────────────────────────
+  // Step 1 — Confirm PCB Loader
   log(`Detecting PCB Loader (Slave ID ${PCB_LOADER_SLAVE_ID})…`, 5);
   let loaderFound = false;
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -549,7 +781,7 @@ async function runInitSequence() {
   }
   log(`✓ PCB Loader confirmed (ID ${PCB_LOADER_SLAVE_ID})`, 10);
 
-  // ── Step 2: Detect P&P stations ─────────────────────────────────────────
+  // Step 2 — Detect P&P stations
   log('Detecting Pick and Place stations…', 20);
   const foundPnp = [];
   for (const sid of SLAVE_IDS) {
@@ -569,12 +801,7 @@ async function runInitSequence() {
 
   const allStations = [PCB_LOADER_SLAVE_ID, ...foundPnp];
 
-  // ── Step 3: Verify IDs, set setup page, write default counts ────────────
-  //
-  // (Previously "Phase 4" — now the only hardware-write step.)
-  // No soft reset or UI-load wait is performed.  The stations are assumed to
-  // already be running their UI (they were not reset).
-
+  // Step 3 — Verify IDs, set ACTIVE_PAGE_ID=1 (setup), write default counts
   log('\nVerifying IDs, setting setup page and default components…', 40);
 
   for (let i = 0; i < allStations.length; i++) {
@@ -590,7 +817,7 @@ async function runInitSequence() {
       throw new Error(`${name} ID mismatch: expected ${sid}, got ${stationId}`);
     }
 
-    // Set active page to Setup
+    // Set ACTIVE_PAGE_ID = 1
     const pageOk = await modbusHandler.setActivePage(
       sid, PageID.PLACEMENT_PARAMETERS_SETUP
     );
@@ -621,7 +848,10 @@ async function runInitSequence() {
     });
   }
 
-  // ── Done ─────────────────────────────────────────────────────────────────
+  // All stations are now on page 1 (PLACEMENT_PARAMETERS_SETUP)
+  currentStationPage     = PageID.PLACEMENT_PARAMETERS_SETUP;
+  frozenWaitingForClient = false;   // successfully initialized — no longer frozen
+
   log('', 100);
   log('✓ ALL STATIONS INITIALIZED SUCCESSFULLY');
   log(`  PCB Loader  : Slave ID ${PCB_LOADER_SLAVE_ID}`);
@@ -656,7 +886,7 @@ io.on('connection', (socket) => {
   clientCount++;
   console.log(`[Socket] Active clients: ${clientCount}`);
 
-  // Send current state to the newly connected client
+  // Send current state to new client
   socket.emit('systemState', buildSystemState());
   socket.emit('connectionState', {
     connected:         modbusHandler?.connected ?? false,
@@ -671,26 +901,54 @@ io.on('connection', (socket) => {
     socket.emit('snapshot', stationManager.getSnapshot());
   }
 
-  // If loader is present but init was held for a client, start it now
-  if (initPendingForClient && clientCount === 1) {
+  // ── Decide what to do on this new connection ──────────────────────────────
+
+  if (frozenWaitingForClient && loaderPresent && clientCount === 1) {
+    // ── Case A: system was frozen (page 0) and ID5 is present ─────────────
+    // Re-initialize: set ACTIVE_PAGE_ID=1, then run full init sequence.
+    console.log(
+      '[Socket] Client connected — system frozen with ID5 present, ' +
+      're-initializing (ACTIVE_PAGE_ID=1)…'
+    );
+    setImmediate(async () => {
+      await _onClientReconnectWhileFrozen(socket);
+    });
+
+  } else if (frozenWaitingForClient && !loaderPresent && clientCount === 1) {
+    // ── Case B: frozen but ID5 is still absent ─────────────────────────────
+    // Stay frozen; set pending flag so init fires when ID5 appears.
+    console.log(
+      '[Socket] Client connected — system frozen but ID5 absent, ' +
+      'waiting for ID5 before initializing…'
+    );
+    initPendingForClient   = true;
+    frozenWaitingForClient = false;   // client is now here; pending covers the rest
+
+  } else if (initPendingForClient && clientCount === 1) {
+    // ── Case C: loader appeared before any client was connected ───────────
     console.log(
       '[Socket] First web client connected and init was pending — ' +
       'starting initialization now'
     );
     setImmediate(async () => {
       initPendingForClient = false;
-      // Inform the new client that the loader is present before init starts
       socket.emit('loaderDetected', { slaveId: PCB_LOADER_SLAVE_ID });
       await _startInitSequence();
     });
   }
 
+  // ── Client disconnect ─────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     clientCount = Math.max(0, clientCount - 1);
     console.log(
-      `[Socket] Client disconnected: ${socket.id} — ` +
-      `Active clients: ${clientCount}`
+      `[Socket] Client disconnected: ${socket.id} — Active clients: ${clientCount}`
     );
+
+    if (clientCount === 0) {
+      setImmediate(async () => {
+        await onLastClientDisconnected();
+      });
+    }
   });
 });
 
@@ -886,6 +1144,7 @@ app.post('/api/configuration/soft-reset', async (_req, res) => {
     for (const sid of availableStations) {
       await modbusHandler.setActivePage(sid, PageID.PLACEMENT_PARAMETERS_SETUP);
     }
+    currentStationPage = PageID.PLACEMENT_PARAMETERS_SETUP;
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
