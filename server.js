@@ -20,11 +20,14 @@
  *    true         *       *    *   │ do nothing — wait for operator to confirm
  *    false        0       *    *   │ set PAGE=0 → wait for client
  *    false       >0       Y    Y   │ normal operation (PAGE already 1 or 2)
- *    false       >0       N    Y   │ set PAGE=0 → watch ID5 cyclically
- *    false       >0       N    N   │ set PAGE=0 → watch ID4 cyclically
+ *    false       >0       N    Y   │ prune list to [ID4] → watch ID5 cyclically
+ *    false       >0       N    N   │ clear list → watch ID4 cyclically
  *
  *  Re-entry to normal operation always:
- *    ID4 alive AND ID5 alive AND clients > 0  →  set PAGE=1 → resume
+ *    ID4 alive AND ID5 alive AND clients > 0  →  runInitSequence() → resume
+ *
+ *  KEY RULE: when ID5 is offline, availableStations is pruned to [ID4_SLAVE_ID]
+ *  so NO Modbus communication reaches ID1/2/3 until full re-init completes.
  */
 
 'use strict';
@@ -114,9 +117,8 @@ let currentPage = null;   // last PAGE written to stations
 
 let monitorTimer = null;
 
-// ── NEW: set to true between 'productionComplete' and 'acknowledge-complete' ──
-// While true the cyclic monitor will not touch the stations or change state,
-// so the operator can take as long as needed to click the confirmation button.
+// ── set to true between 'productionComplete' and 'acknowledge-complete' ──────
+// While true the cyclic monitor will not touch the stations or change state.
 let awaitingProductionAck = false;
 
 let systemStatus  = 'idle';
@@ -160,7 +162,7 @@ function log(message, pct = null) {
 
 // ─── PING HELPERS ─────────────────────────────────────────────────────────────
 
-async function pingStation(slaveId, timeoutMs = 1000) {
+async function pingStation(slaveId, timeoutMs = 400) {
   if (!modbusHandler || !modbusHandler.connected) return false;
   for (let i = 0; i < PING_RETRIES; i++) {
     try {
@@ -181,22 +183,22 @@ async function pingStation(slaveId, timeoutMs = 1000) {
   return false;
 }
 
-// ─── PAGE WRITE HELPER ────────────────────────────────────────────────────────
+// ─── PAGE WRITE HELPERS ───────────────────────────────────────────────────────
 
-async function setPageOnAllStations(pageId) {
+/**
+ * Write PAGE=pageId to an explicit list of stations.
+ * This is the authoritative function — callers decide exactly which
+ * stations to write to, preventing stale-list bugs.
+ *
+ * @param {number}   pageId       PageID constant
+ * @param {number[]} stationList  Explicit list of slave IDs to write to
+ */
+async function setPageOnStations(pageId, stationList) {
   if (!modbusHandler || !modbusHandler.connected) return;
+  if (!stationList || stationList.length === 0) return;
 
-  const stations = availableStations.length > 0
-    ? availableStations
-    : [
-        ...(id5Alive               ? [PCB_LOADER_SLAVE_ID] : []),
-        ...(pnpStations.length > 0 ? pnpStations           : []),
-      ];
-
-  if (stations.length === 0) return;
-
-  console.log(`[Page] Writing PAGE=${pageId} to stations [${stations}]`);
-  for (const sid of stations) {
+  console.log(`[Page] Writing PAGE=${pageId} to stations [${stationList}]`);
+  for (const sid of stationList) {
     try {
       const ok = await modbusHandler.setActivePage(sid, pageId);
       console.log(`[Page]   Station ${sid} → ${ok ? 'OK' : 'FAILED'}`);
@@ -205,6 +207,21 @@ async function setPageOnAllStations(pageId) {
     }
   }
   currentPage = pageId;
+}
+
+/**
+ * Convenience wrapper — writes PAGE to whatever is currently in
+ * availableStations (or falls back to id5Alive / pnpStations).
+ * Used by soft-reset and other non-monitor code paths.
+ */
+async function setPageOnAllStations(pageId) {
+  const stations = availableStations.length > 0
+    ? availableStations
+    : [
+        ...(id5Alive               ? [PCB_LOADER_SLAVE_ID] : []),
+        ...(pnpStations.length > 0 ? pnpStations           : []),
+      ];
+  await setPageOnStations(pageId, stations);
 }
 
 // ─── STATION-MANAGER EMIT ─────────────────────────────────────────────────────
@@ -232,7 +249,7 @@ function managerEmit(event) {
       break;
 
     case 'productionComplete':
-      // ── Set the ack-guard BEFORE the status update so the monitor sees it
+      // Set the ack-guard BEFORE the status update so the monitor sees it
       // immediately on the next tick.
       awaitingProductionAck = true;
       console.log('[Server] productionComplete — awaitingProductionAck=true');
@@ -282,9 +299,9 @@ async function getCandidatePorts() {
 
 function silentClose(client) {
   if (!client) return;
-  try { client.removeAllListeners(); }            catch { /* ignore */ }
-  try { if (client._port) client._port.removeAllListeners(); } catch { /* ignore */ }
-  try { if (client.isOpen) client.close(() => {}); }           catch { /* ignore */ }
+  try { client.removeAllListeners(); }                                    catch { /* ignore */ }
+  try { if (client._port) client._port.removeAllListeners(); }           catch { /* ignore */ }
+  try { if (client.isOpen) client.close(() => {}); }                     catch { /* ignore */ }
 }
 
 async function probePort(portPath) {
@@ -341,7 +358,7 @@ async function openPort(portPath) {
     modbusHandler = null;
   }
 
-  modbusHandler = new ModbusHandler(portPath, { timeoutMs: 1000, retries: 2, retryDelayMs: 200 });
+  modbusHandler = new ModbusHandler(portPath, { timeoutMs: 100, retries: 2, retryDelayMs: 100 });
   const ok = await modbusHandler.connect();
   if (!ok) {
     console.error(`[Server] Failed to open ${portPath}`);
@@ -413,7 +430,10 @@ async function waitForId5AndClient() {
     if (!id4Alive) {
       console.log('[Start] ID4 went offline during wait — restarting start phase');
       setStatus('error', 'Bus lost during startup — rescanning…');
-      if (modbusHandler) { try { modbusHandler.disconnect(); } catch { /* ignore */ } modbusHandler = null; }
+      if (modbusHandler) {
+        try { modbusHandler.disconnect(); } catch { /* ignore */ }
+        modbusHandler = null;
+      }
       detectedPort = null;
       await sleep(PORT_RESCAN_DELAY_MS);
       return runStartPhase();
@@ -503,7 +523,9 @@ async function runInitSequence() {
     log(`  Pick & Place: Slave IDs [${foundPnp}]`);
 
     setStatus('ready', `System ready — ${foundPnp.length} P&P station(s) online`);
-    broadcast('connectionState', { connected: true, availableStations, loaderStationId, pnpStations });
+    broadcast('connectionState', {
+      connected: true, availableStations, loaderStationId, pnpStations,
+    });
     return true;
 
   } catch (err) {
@@ -514,7 +536,9 @@ async function runInitSequence() {
     pnpStations       = [];
     stationManager    = null;
     currentPage       = null;
-    broadcast('connectionState', { connected: false, availableStations: [], loaderStationId, pnpStations: [] });
+    broadcast('connectionState', {
+      connected: false, availableStations: [], loaderStationId, pnpStations: [],
+    });
     return false;
   }
 }
@@ -562,19 +586,44 @@ async function _doMonitorTick() {
       workState = WorkState.NO_CLIENT;
 
       if (stationManager) { stationManager._stopPolling(); stationManager = null; }
-      await setPageOnAllStations(PageID.STARTUP);
+
+      // Capture the full station list BEFORE clearing global arrays.
+      // This ensures we write PAGE=0 to exactly the stations that were
+      // active — no more, no less.
+      const stationsToReset = [...availableStations];
       availableStations = [];
       pnpStations       = [];
 
+      // Write PAGE=0 only to the stations we just captured.
+      await setPageOnStations(PageID.STARTUP, stationsToReset);
+
       setStatus('idle', 'Web client disconnected — waiting for initialization…');
-      broadcast('connectionState', { connected: false, availableStations: [], loaderStationId, pnpStations: [] });
+      broadcast('connectionState', {
+        connected: false, availableStations: [], loaderStationId, pnpStations: [],
+      });
     }
     return;
   }
 
   // ── 2. Clients present — check bus ───────────────────────────────────────
+  // Always ping ID4 first; only ping ID5 if ID4 is alive.
   id4Alive = await pingStation(ID4_SLAVE_ID, PROBE_TIMEOUT_MS);
   id5Alive = id4Alive ? await pingStation(PCB_LOADER_SLAVE_ID, PROBE_TIMEOUT_MS) : false;
+
+  // ── DEBUG: log current ping targets in wait states ────────────────────────
+  if (workState === WorkState.WAIT_ID5) {
+    console.log(
+      `[Monitor] WAIT_ID5 state — ` +
+      `ID4(${ID4_SLAVE_ID})=${id4Alive}, ID5(${PCB_LOADER_SLAVE_ID})=${id5Alive} ` +
+      `— slave list: [${availableStations}]`
+    );
+  } else if (workState === WorkState.WAIT_ID4) {
+    console.log(
+      `[Monitor] WAIT_ID4 state — ` +
+      `ID4(${ID4_SLAVE_ID})=${id4Alive} ` +
+      `— slave list: [${availableStations}]`
+    );
+  }
 
   // ── 2a. Both alive ────────────────────────────────────────────────────────
   if (id4Alive && id5Alive) {
@@ -584,42 +633,87 @@ async function _doMonitorTick() {
       const ok = await runInitSequence();
       if (!ok) workState = WorkState.WAIT_ID5;
     }
+    // If workState is already NORMAL the station manager handles everything.
     return;
   }
 
   // ── 2b. ID4 alive, ID5 gone ───────────────────────────────────────────────
   if (id4Alive && !id5Alive) {
     if (workState !== WorkState.WAIT_ID5) {
-      console.log('[Monitor] ID5 gone (ID4 OK) → PAGE=0, entering WAIT_ID5');
-      workState = WorkState.WAIT_ID5;
+      console.log('[Monitor] ID5 gone (ID4 OK) → entering WAIT_ID5');
 
+      // ── Step 1: stop station manager immediately ──────────────────────────
+      // Must happen before ANY list mutation so the manager cannot race and
+      // trigger a Modbus write to a station we are about to remove.
       if (stationManager) { stationManager._stopPolling(); stationManager = null; }
-      await setPageOnAllStations(PageID.STARTUP);
-      availableStations = [];
+
+      // ── Step 2: capture full list, THEN prune ────────────────────────────
+      // We write PAGE=0 to every station that was previously active (one-shot
+      // so their displays show the "waiting" screen), then we prune the list
+      // down to [ID4_SLAVE_ID] only.  From this point on, the cyclic monitor
+      // will contact ONLY ID4 and ID5 — never ID1/2/3.
+      const stationsToReset = [...availableStations];
+
+      availableStations = [ID4_SLAVE_ID];   // ← KEY FIX: prune, don't clear
       pnpStations       = [];
+
+      console.log(
+        `[Monitor] Slave list pruned: [${stationsToReset}] → [${availableStations}] ` +
+        `(ID4 only — ID1/2/3 will NOT be contacted until full re-init)`
+      );
+
+      // Write PAGE=0 to all previously-active stations (one-time flush).
+      await setPageOnStations(PageID.STARTUP, stationsToReset);
+
+      workState = WorkState.WAIT_ID5;
 
       setStatus('idle', 'PCB Loader (ID5) disconnected — waiting for reconnection…');
       broadcast('loaderRemoved', { slaveId: PCB_LOADER_SLAVE_ID });
-      broadcast('connectionState', { connected: false, availableStations: [], loaderStationId, pnpStations: [] });
+      broadcast('connectionState', {
+        connected: false, availableStations: [], loaderStationId, pnpStations: [],
+      });
     }
+    // While in WAIT_ID5 we only ping ID4 and ID5 (done at the top of this
+    // function).  No Modbus writes to ID1/2/3 happen anywhere below this line.
     return;
   }
 
   // ── 2c. ID4 gone ─────────────────────────────────────────────────────────
+  // Handles both: previously NORMAL (all stations) and previously WAIT_ID5
+  // (list was already pruned to [ID4]).
   if (!id4Alive) {
     if (workState !== WorkState.WAIT_ID4) {
-      console.log('[Monitor] ID4 gone → PAGE=0, entering WAIT_ID4');
-      workState = WorkState.WAIT_ID4;
+      console.log('[Monitor] ID4 gone → entering WAIT_ID4');
 
+      // ── Step 1: stop station manager ─────────────────────────────────────
       if (stationManager) { stationManager._stopPolling(); stationManager = null; }
-      await setPageOnAllStations(PageID.STARTUP);
-      availableStations = [];
+
+      // ── Step 2: capture current list (may already be [ID4] or []) ────────
+      const stationsToReset = [...availableStations];
+
+      availableStations = [];   // nothing left to talk to
       pnpStations       = [];
       id5Alive          = false;
 
+      console.log(
+        `[Monitor] Slave list cleared: [${stationsToReset}] → [] ` +
+        `(only pinging ID4 until bus recovers)`
+      );
+
+      // Attempt PAGE=0 on whatever was in the list.
+      // This may fail/timeout if the bus is truly dead — that is expected.
+      if (stationsToReset.length > 0) {
+        await setPageOnStations(PageID.STARTUP, stationsToReset);
+      }
+
+      workState = WorkState.WAIT_ID4;
+
       setStatus('error', 'Bus offline (ID4 not responding) — waiting for bus recovery…');
-      broadcast('connectionState', { connected: false, availableStations: [], loaderStationId, pnpStations: [] });
+      broadcast('connectionState', {
+        connected: false, availableStations: [], loaderStationId, pnpStations: [],
+      });
     }
+    // While in WAIT_ID4 we only ping ID4 (done at the top of this function).
     return;
   }
 }
@@ -630,7 +724,7 @@ async function onClientReconnectedInWorkingPhase() {
   if (phase !== Phase.WORKING)           return;
   if (workState !== WorkState.NO_CLIENT) return;
 
-  // Do not interfere while waiting for the operator to confirm production end
+  // Do not interfere while waiting for the operator to confirm production end.
   if (awaitingProductionAck) {
     console.log('[Working] Client reconnected during production-ack wait — no action needed');
     return;
@@ -642,19 +736,56 @@ async function onClientReconnectedInWorkingPhase() {
   id5Alive = id4Alive ? await pingStation(PCB_LOADER_SLAVE_ID, PROBE_TIMEOUT_MS) : false;
 
   if (id4Alive && id5Alive) {
+    // Both alive — full re-init, which will detect all active P&P stations.
     console.log('[Working] ID4+ID5 alive → re-initializing (PAGE=1)');
     workState = WorkState.NORMAL;
     const ok = await runInitSequence();
     if (!ok) workState = WorkState.WAIT_ID5;
+
   } else if (id4Alive && !id5Alive) {
-    console.log('[Working] ID4 alive, ID5 absent → WAIT_ID5');
+    // ID4 alive, ID5 absent — prune list to ID4 only (same logic as monitor).
+    console.log('[Working] ID4 alive, ID5 absent → WAIT_ID5, pruning slave list to [ID4]');
+
+    const stationsToReset = [...availableStations];
+    availableStations = [ID4_SLAVE_ID];
+    pnpStations       = [];
+
+    console.log(
+      `[Working] Slave list pruned: [${stationsToReset}] → [${availableStations}]`
+    );
+
+    if (stationsToReset.length > 0) {
+      await setPageOnStations(PageID.STARTUP, stationsToReset);
+    }
+
     workState = WorkState.WAIT_ID5;
     setStatus('idle', 'PCB Loader (ID5) not found — waiting for reconnection…');
     broadcast('loaderRemoved', { slaveId: PCB_LOADER_SLAVE_ID });
+    broadcast('connectionState', {
+      connected: false, availableStations: [], loaderStationId, pnpStations: [],
+    });
+
   } else {
-    console.log('[Working] ID4 absent → WAIT_ID4');
+    // ID4 absent — clear everything.
+    console.log('[Working] ID4 absent → WAIT_ID4, clearing slave list');
+
+    const stationsToReset = [...availableStations];
+    availableStations = [];
+    pnpStations       = [];
+
+    console.log(
+      `[Working] Slave list cleared: [${stationsToReset}] → []`
+    );
+
+    if (stationsToReset.length > 0) {
+      await setPageOnStations(PageID.STARTUP, stationsToReset);
+    }
+
     workState = WorkState.WAIT_ID4;
     setStatus('error', 'Bus offline — waiting for bus recovery…');
+    broadcast('connectionState', {
+      connected: false, availableStations: [], loaderStationId, pnpStations: [],
+    });
   }
 }
 
@@ -692,6 +823,7 @@ io.on('connection', (socket) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/system/status', (_req, res) => res.json(buildSystemState()));
+
 
 app.get('/api/setup/components', async (_req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
@@ -749,14 +881,12 @@ app.get('/api/operation/snapshot', (_req, res) => {
 // ─── ACKNOWLEDGE PRODUCTION COMPLETE ─────────────────────────────────────────
 //
 // Called by the GUI after the operator clicks OK on the production-complete
-// dialog.  This is the ONLY place that clears awaitingProductionAck.
+// dialog. This is the ONLY place that clears awaitingProductionAck.
 
 app.post('/api/operation/acknowledge-complete', async (_req, res) => {
   console.log('[Server] acknowledge-complete received');
 
   if (!stationManager) {
-    // The station manager was already destroyed (should not happen now that the
-    // monitor guards on awaitingProductionAck, but handle it gracefully).
     console.warn('[Server] acknowledge-complete: no station manager — clearing ack flag');
     awaitingProductionAck = false;
     return res.status(400).json({ error: 'No station manager active' });
@@ -780,14 +910,34 @@ app.get('/api/configuration', async (_req, res) => {
     return res.status(400).json({ error: 'No P&P stations connected' });
   const sid = pnpStations[0];
   try {
-    const timing = await modbusHandler.readHoldingRegisters(sid, HoldingRegisterAddresses.TRANSISTOR_PLACEMENT_DURATION_MS, 5);
-    const led    = await modbusHandler.readHoldingRegisters(sid, HoldingRegisterAddresses.BRIGHTNESS_RED_LED, 6);
-    const rfid   = await modbusHandler.readHoldingRegisters(sid, HoldingRegisterAddresses.RFID_BOX_UID_START, 12);
-    const vol    = await modbusHandler.readHoldingRegisters(sid, HoldingRegisterAddresses.SPEAKER_VOLUME, 1);
+    const timing = await modbusHandler.readHoldingRegisters(
+      sid, HoldingRegisterAddresses.TRANSISTOR_PLACEMENT_DURATION_MS, 5
+    );
+    const led = await modbusHandler.readHoldingRegisters(
+      sid, HoldingRegisterAddresses.BRIGHTNESS_RED_LED, 6
+    );
+    const rfid = await modbusHandler.readHoldingRegisters(
+      sid, HoldingRegisterAddresses.RFID_BOX_UID_START, 12
+    );
+    const vol = await modbusHandler.readHoldingRegisters(
+      sid, HoldingRegisterAddresses.SPEAKER_VOLUME, 1
+    );
     res.json({
-      timing: timing ? { transistor: timing[0], diode: timing[1], ic: timing[2], capacitor: timing[3], transport: timing[4] } : null,
-      led:    led    ? { red: led[0], yellow: led[1], green: led[2], rgb: led[3], thresholdYellow: led[4], thresholdRed: led[5] } : null,
-      rfid:   rfid   ? Array.from({ length: 4 }, (_, i) => ({ uidHigh: rfid[i*2], uidLow: rfid[i*2+1], count: rfid[8+i] })) : null,
+      timing: timing
+        ? { transistor: timing[0], diode: timing[1], ic: timing[2],
+            capacitor: timing[3], transport: timing[4] }
+        : null,
+      led: led
+        ? { red: led[0], yellow: led[1], green: led[2], rgb: led[3],
+            thresholdYellow: led[4], thresholdRed: led[5] }
+        : null,
+      rfid: rfid
+        ? Array.from({ length: 4 }, (_, i) => ({
+            uidHigh: rfid[i * 2],
+            uidLow:  rfid[i * 2 + 1],
+            count:   rfid[8 + i],
+          }))
+        : null,
       volume: vol ? vol[0] : null,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -798,13 +948,19 @@ app.post('/api/configuration', async (req, res) => {
   const { timing, led, rfid, volume } = req.body;
   try {
     for (const sid of availableStations) {
-      if (timing) await modbusHandler.setTimingConfig(sid, timing.transistor, timing.diode, timing.ic, timing.capacitor, timing.transport);
-      if (led)    await modbusHandler.setLedConfig(sid, led.red, led.yellow, led.green, led.rgb, led.thresholdYellow, led.thresholdRed);
+      if (timing) await modbusHandler.setTimingConfig(
+        sid, timing.transistor, timing.diode, timing.ic, timing.capacitor, timing.transport
+      );
+      if (led) await modbusHandler.setLedConfig(
+        sid, led.red, led.yellow, led.green, led.rgb, led.thresholdYellow, led.thresholdRed
+      );
       if (rfid) {
         const vals = [];
         rfid.forEach(b => vals.push(b.uidHigh, b.uidLow));
         rfid.forEach(b => vals.push(b.count));
-        await modbusHandler.writeHoldingRegisters(sid, HoldingRegisterAddresses.RFID_BOX_UID_START, vals);
+        await modbusHandler.writeHoldingRegisters(
+          sid, HoldingRegisterAddresses.RFID_BOX_UID_START, vals
+        );
       }
       if (volume != null) await modbusHandler.setSpeakerVolume(sid, volume);
     }
@@ -816,8 +972,11 @@ app.post('/api/configuration/soft-reset', async (_req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   try {
     for (const sid of availableStations)
-      if (!(await modbusHandler.softReset(sid))) throw new Error(`Reset failed on ${sid}`);
+      if (!(await modbusHandler.softReset(sid)))
+        throw new Error(`Reset failed on ${sid}`);
+
     await sleep(2000);
+
     const deadline = Date.now() + 10000;
     while (Date.now() < deadline) {
       let all = true;
@@ -826,9 +985,11 @@ app.post('/api/configuration/soft-reset', async (_req, res) => {
       if (all) break;
       await sleep(200);
     }
+
     for (const sid of availableStations)
       await modbusHandler.setActivePage(sid, PageID.PLACEMENT_PARAMETERS_SETUP);
     currentPage = PageID.PLACEMENT_PARAMETERS_SETUP;
+
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -840,8 +1001,12 @@ app.get('/api/monitoring', async (_req, res) => {
     for (const sid of [loaderStationId, ...pnpStations]) {
       result[sid] = {
         statusData:   await modbusHandler.getAllStatus(sid),
-        inputCoils:   await modbusHandler.readCoils(sid, CoilAddresses.INPUT_TRANSISTOR_1_IS_POPULATED, 14),
-        outputInputs: await modbusHandler.readDiscreteInputs(sid, DiscreteInputAddresses.OUTPUT_TRANSISTOR_1_IS_POPULATED, 14),
+        inputCoils:   await modbusHandler.readCoils(
+          sid, CoilAddresses.INPUT_TRANSISTOR_1_IS_POPULATED, 14
+        ),
+        outputInputs: await modbusHandler.readDiscreteInputs(
+          sid, DiscreteInputAddresses.OUTPUT_TRANSISTOR_1_IS_POPULATED, 14
+        ),
       };
     }
     res.json(result);
